@@ -1193,25 +1193,29 @@ shinyServer(function(input, output, session) {
       m2 <- mean(expr[group2], na.rm = TRUE)
       v1 <- var(expr[group1], na.rm = TRUE)
       v2 <- var(expr[group2], na.rm = TRUE)
-      n1 <- length(group1)
-      n2 <- length(group2)
+      n1 <- sum(!is.na(expr[group1]))
+      n2 <- sum(!is.na(expr[group2]))
+      m_all <- mean(expr, na.rm = TRUE)
+      sd_all <- sd(expr, na.rm = TRUE)    
       
       # Skip if mean or variance is NA
       if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) {
         next
       }
       
-      z <- ifelse(n1 < 2 | n2 < 2, NA_real_,
+      t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
                   (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
+
+      z <-  (m1 - m_all) / sd_all
       
-      res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, zscore = z)
+      res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, tstat = t, zscore = z)
     }
     
     h5file$close_all()
     
     # Combine results and sort
     res <- rbindlist(res, use.names = TRUE, fill = TRUE)
-    res <- res[order(-(zscore))][1:30]
+    res <- res[order(-(tstat))][1:30]
     # Round numeric columns to 3 decimal places
     numeric_cols <- sapply(res, is.numeric)
     res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
