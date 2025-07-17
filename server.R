@@ -1155,82 +1155,70 @@ shinyServer(function(input, output, session) {
   
   output$sel_ncells <- renderText({
     ids <- selected_cells_rv()
-    print(paste("Selected cell IDs:", ids))  # Debug: Print selected cell IDs
+    print(c("Selected cell IDs:", ids))  # Debug: Print selected cell IDs
     if (is.null(ids)) "None selected"
     else paste(length(ids), "cells")
   })
   
   observeEvent(input$do_marker, {
     ids <- selected_cells_rv()
-    print(paste("Number of selected cells:", length(ids)))  # Debug: Print number of selected cells
     validate(need(!is.null(ids) && length(ids) > 5, "Select at least 5 cells"))
     
     group1 <- as.numeric(ids)
     group2 <- as.numeric(setdiff(seq_len(nrow(sc1meta)), ids))
-    print(paste("Group 1 size:", length(group1)))  # Debug: Print size of group1
-    print(paste("Group 2 size:", length(group2)))  # Debug: Print size of group2
     req(length(group2) > 5)
     
     library(hdf5r)
+    library(data.table)
+    
     h5file <- H5File$new("sc1gexpr.h5", mode = "r")
     h5data <- h5file[["grp"]][["data"]]
-    print("HDF5 file loaded successfully")  # Debug: Confirm HDF5 file is loaded
     
-    res <- data.table::data.table(
-      gene = character(), avg_sel = numeric(), avg_rest = numeric(), zscore = numeric()
-    )
+    # Preallocate results for efficiency
+    res <- vector("list", length(top_hvg))
     
-
-    for (g in top_hvg) {
-      print(paste("Processing gene:", g))  # Debug: Print the current gene
+    # Process genes in a vectorized manner
+    for (i in seq_along(top_hvg)) {
+      g <- top_hvg[i]
       gi <- sc1gene[[g]]
       expr <- h5data$read(args = list(gi, quote(expr = )))
-      print(paste("Expression data for gene:", g, "loaded"))  # Debug: Confirm expression data is loaded
-
-      print(c("Group 1 ids:", group1, " class: ", class(group1)))  # Debug: Print size of group1
-      print(c("Group 2 ids:", group2, " class: ", class(group2)))  # Debug: Print size of group2
       
-      # Skip genes where all expression values are NA for group1 or group2
-      if (all(is.na(expr[group1]))) {
-        print(paste("Skipping gene:", g, "as all group1 values are NA"))  # Debug: Skipping gene
+      # Skip genes with all NA values in either group
+      if (all(is.na(expr[group1])) || all(is.na(expr[group2]))) {
         next
       }
-      if (all(is.na(expr[group2]))) {
-        print(paste("Skipping gene:", g, "as all group2 values are NA"))  # Debug: Skipping gene
-        next
-      }
-
+      
       # Calculate statistics
-      m1 <- mean(expr[group1], na.rm = TRUE)  # Use na.rm = TRUE to ignore NA values
+      m1 <- mean(expr[group1], na.rm = TRUE)
       m2 <- mean(expr[group2], na.rm = TRUE)
       v1 <- var(expr[group1], na.rm = TRUE)
       v2 <- var(expr[group2], na.rm = TRUE)
       n1 <- length(group1)
       n2 <- length(group2)
-
+      
       # Skip if mean or variance is NA
       if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) {
-        print(paste("Skipping gene:", g, "due to NA in statistics"))  # Debug: Skipping gene
         next
       }
-
+      
       z <- ifelse(n1 < 2 | n2 < 2, NA_real_,
-            (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
-
-      print(paste("Gene:", g, "m1:", m1, "m2:", m2, "z-score:", z))  # Debug: Print stats for the gene
-
-      res <- data.table::rbindlist(list(res,
-                        data.table(gene = g, avg_sel = m1, avg_rest = m2, zscore = z)))
-
+                  (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
+      
+      res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, zscore = z)
     }
     
     h5file$close_all()
-    res <- res[order(-abs(zscore))][1:30]
-    print("Marker discovery completed")  # Debug: Confirm marker discovery is complete
-    print(res)  # Debug: Print the resulting data table
+    
+    # Combine results and sort
+    res <- rbindlist(res, use.names = TRUE, fill = TRUE)
+    res <- res[order(-(zscore))][1:30]
+    # Round numeric columns to 3 decimal places
+    numeric_cols <- sapply(res, is.numeric)
+    res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
+
     marker_tbl_rv(res)
     output$sel_markers_tbl <- DT::renderDT({
-      DT::datatable(res, options=list(dom="t", pageLength=30), rownames=FALSE)
+      DT::datatable(res, options = list(dom = "t", pageLength = 30), rownames = FALSE)
     })
   })
   
