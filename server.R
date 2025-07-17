@@ -10,6 +10,7 @@ library(hdf5r)
 library(ggdendro) 
 library(gridExtra) 
 library(plotly)
+
 sc1conf = readRDS("sc1conf.rds")
 sc1def  = readRDS("sc1def.rds")
 sc1gene = readRDS("sc1gene.rds")
@@ -1128,30 +1129,48 @@ shinyServer(function(input, output, session) {
   top_hvg <- readRDS("var_features.rds")
   top_hvg <- intersect(top_hvg, names(sc1gene)) 
   
-  selected_cells_rv <- reactiveVal(NULL)
+  selected_cells_rv <- reactive({
+    sel <- event_data("plotly_selected", source = "select_umap")
+    if (is.null(sel) || nrow(sel) == 0) NULL else sel$key
+  })
   marker_tbl_rv     <- reactiveVal(NULL)
-  
+  sc1meta$cellid <- sc1meta$cellid %||% rownames(sc1meta)
+
   output$sel_umap <- renderPlotly({
     req(sc1meta)
-    umap_x <- grep("UMAP|tSNE", names(sc1meta), value=TRUE)[1]
-    umap_y <- grep("UMAP|tSNE", names(sc1meta), value=TRUE)[2]
+    umap_x <- grep("UMAP|tSNE", names(sc1meta), value = TRUE)[1]
+    umap_y <- grep("UMAP|tSNE", names(sc1meta), value = TRUE)[2]
     validate(need(!is.na(umap_x) & !is.na(umap_y), "UMAP columns not found"))
-    sc1meta$cellid <- sc1meta$cellid %||% rownames(sc1meta)
-    p <- ggplot(sc1meta, aes_string(x=umap_x, y=umap_y, key="cellid", color= "orig.ident", text="orig.ident")) +
-      geom_point(size=1, alpha=0.6) +
-      xlab(umap_x) + ylab(umap_y) + ggtitle("Interactive UMAP") +
-      theme_minimal(base_size=16) +
-      theme(legend.position = "none")
-    plotly_obj <- ggplotly(p, source = "select_umap", tooltip = "text")
-    event_register(plotly_obj, "plotly_selected")
     
+    # Do factoring if required
+    if (!is.na(sc1conf[UI == "orig.ident"]$fCL)) {
+      ggCol <- strsplit(sc1conf[UI == "orig.ident"]$fCL, "\\|")[[1]]
+      names(ggCol) <- levels(sc1meta$orig.ident)
+      ggLvl <- levels(sc1meta$orig.ident)[levels(sc1meta$orig.ident) %in% unique(sc1meta$orig.ident)]
+      sc1meta$orig.ident <- factor(sc1meta$orig.ident, levels = ggLvl)
+      ggCol <- ggCol[ggLvl]
+    }
+    
+    # Use plotly directly for better performance
+    plotly_obj <- plot_ly(
+      data = sc1meta,
+      x = ~get(umap_x),
+      y = ~get(umap_y),
+      type = "scatter",
+      mode = "markers",
+      marker = list(size = 5, opacity = 0.6),
+      color = ~orig.ident,
+      colors = ggCol,
+      text = ~orig.ident,
+      hoverinfo = "text",  # Show only the text in the tooltip
+      key = ~cellid,
+      source = "select_umap" 
+    ) %>%
+      layout(title = "Interactive UMAP", xaxis = list(title = umap_x), yaxis = list(title = umap_y), showlegend = FALSE)
+    plotly_obj <- event_register(plotly_obj, "plotly_selected")
     plotly_obj
   })
   
-  observe({
-    sel <- event_data("plotly_selected", source="select_umap")
-    if(is.null(sel) || nrow(sel)==0) selected_cells_rv(NULL) else selected_cells_rv(sel$key)
-  })
   
   output$sel_ncells <- renderText({
     ids <- selected_cells_rv()
@@ -1161,68 +1180,71 @@ shinyServer(function(input, output, session) {
   })
   
   observeEvent(input$do_marker, {
-    ids <- selected_cells_rv()
-    validate(need(!is.null(ids) && length(ids) > 5, "Select at least 5 cells"))
-    
-    group1 <- as.numeric(ids)
-    group2 <- as.numeric(setdiff(seq_len(nrow(sc1meta)), ids))
-    req(length(group2) > 5)
-    
-    library(hdf5r)
-    library(data.table)
-    
-    h5file <- H5File$new("sc1gexpr.h5", mode = "r")
-    h5data <- h5file[["grp"]][["data"]]
-    
-    # Preallocate results for efficiency
-    res <- vector("list", length(top_hvg))
-    
-    # Process genes in a vectorized manner
-    for (i in seq_along(top_hvg)) {
-      g <- top_hvg[i]
-      gi <- sc1gene[[g]]
-      expr <- h5data$read(args = list(gi, quote(expr = )))
+    withProgress(message = "Processing markers...", value = 0, {
+      ids <- selected_cells_rv()
+      validate(need(!is.null(ids) && length(ids) > 5, "Select at least 5 cells"))
       
-      # Skip genes with all NA values in either group
-      if (all(is.na(expr[group1])) || all(is.na(expr[group2]))) {
-        next
+      group1 <- as.numeric(ids)
+      group2 <- as.numeric(setdiff(seq_len(nrow(sc1meta)), ids))
+      req(length(group2) > 5)
+      
+      h5file <- H5File$new("sc1gexpr.h5", mode = "r")
+      h5data <- h5file[["grp"]][["data"]]
+      
+      # Preallocate results for efficiency
+      res <- vector("list", length(top_hvg))
+      
+      # Process genes with progress updates
+      for (i in seq_along(top_hvg)) {
+        g <- top_hvg[i]
+        gi <- sc1gene[[g]]
+        expr <- h5data$read(args = list(gi, quote(expr = )))
+        
+        # Skip genes with all NA values in either group
+        if (all(is.na(expr[group1])) || all(is.na(expr[group2]))) {
+          next
+        }
+        
+        # Calculate statistics
+        m1 <- mean(expr[group1], na.rm = TRUE)
+        m2 <- mean(expr[group2], na.rm = TRUE)
+        v1 <- var(expr[group1], na.rm = TRUE)
+        v2 <- var(expr[group2], na.rm = TRUE)
+        n1 <- sum(!is.na(expr[group1]))
+        n2 <- sum(!is.na(expr[group2]))
+        m_all <- mean(expr, na.rm = TRUE)
+        sd_all <- sd(expr, na.rm = TRUE)    
+        
+        # Skip if mean or variance is NA
+        if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) {
+          next
+        }
+        
+        t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
+                    (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
+        
+        z <-  (m1 - m_all) / sd_all
+        
+        res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, tstat = t, zscore = z)
+        
+        # Update progress
+        n <- length(top_hvg)
+        if (i %% 200 == 0 || i == n) incProgress(200 / n, detail = paste("Gene", i, "of", n))
       }
       
-      # Calculate statistics
-      m1 <- mean(expr[group1], na.rm = TRUE)
-      m2 <- mean(expr[group2], na.rm = TRUE)
-      v1 <- var(expr[group1], na.rm = TRUE)
-      v2 <- var(expr[group2], na.rm = TRUE)
-      n1 <- sum(!is.na(expr[group1]))
-      n2 <- sum(!is.na(expr[group2]))
-      m_all <- mean(expr, na.rm = TRUE)
-      sd_all <- sd(expr, na.rm = TRUE)    
+      h5file$close_all()
       
-      # Skip if mean or variance is NA
-      if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) {
-        next
-      }
+      # Combine results and sort
+      res <- rbindlist(res, use.names = TRUE, fill = TRUE)
+      res <- res[order(-(tstat))][1:30]
+      # Round numeric columns to 3 decimal places
+      numeric_cols <- sapply(res, is.numeric)
+      res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
       
-      t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
-                  (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
-
-      z <-  (m1 - m_all) / sd_all
-      
-      res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, tstat = t, zscore = z)
-    }
-    
-    h5file$close_all()
-    
-    # Combine results and sort
-    res <- rbindlist(res, use.names = TRUE, fill = TRUE)
-    res <- res[order(-(tstat))][1:30]
-    # Round numeric columns to 3 decimal places
-    numeric_cols <- sapply(res, is.numeric)
-    res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
-
-    marker_tbl_rv(res)
-    output$sel_markers_tbl <- DT::renderDT({
-      DT::datatable(res, options = list(dom = "t", pageLength = 30), rownames = FALSE)
+      marker_tbl_rv(res)
+      output$sel_markers_tbl <- DT::renderDT({
+        DT::datatable(res, options = list(dom = "t", pageLength = 30), rownames = FALSE)
+      })
     })
   })
   
