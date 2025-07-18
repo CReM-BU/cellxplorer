@@ -2,8 +2,11 @@
 
  ## Example
 
+See Selector tab on:
+
 https://crem-bu.shinyapps.io/cellxplorer/
 
+Use interactive Lasso or square tooltip to select a group of cells
 
  ## Requirements
 
