@@ -1135,39 +1135,69 @@ shinyServer(function(input, output, session) {
   marker_tbl_rv     <- reactiveVal(NULL)
   sc1meta$cellid <- sc1meta$cellid %||% rownames(sc1meta)
 
+  get_palette_for_meta <- function(meta_col, sc1conf, sc1meta) {
+    # find the row in sc1conf
+    row <- sc1conf[UI == meta_col]
+    fcl <- row$fCL   # e.g. "red|green|blue|orange"
+    fid <- row$fID   # e.g. "Cluster1|Cluster2|Cluster3|Cluster4"
+    
+    # if there is no fixed‐colour list, return NULL
+    if ( is.na(fcl) || !nzchar(fcl) ) return(NULL)
+    
+    # split into R vectors
+    raw_cols  <- strsplit(fcl,  "\\|")[[1]]
+    raw_levels<- strsplit(fid, "\\|")[[1]]
+    
+    # which of those levels actually appear in the data?
+    present_levels <- intersect(raw_levels, unique(sc1meta[[ meta_col ]]))
+    if (length(present_levels)==0) return(NULL)
+    
+    # subset and match colours to exactly the same positions
+    sel_idx <- match(present_levels, raw_levels)
+    pal_cols<- raw_cols[ sel_idx ]
+    names(pal_cols) <- present_levels
+    
+    # also coerce the metadata column into a factor (most are already)
+    sc1meta[[ meta_col ]] <<- factor(sc1meta[[ meta_col ]],
+                                     levels = present_levels)
+    
+    pal_cols
+  }
+  
   output$sel_umap <- renderPlotly({
-    req(sc1meta)
-    umap_x <- grep("UMAP|tSNE", names(sc1meta), value = TRUE)[1]
-    umap_y <- grep("UMAP|tSNE", names(sc1meta), value = TRUE)[2]
-    validate(need(!is.na(umap_x) & !is.na(umap_y), "UMAP columns not found"))
+    req(input$sel_meta_col)
     
-    # Do factoring if required
-    if (!is.na(sc1conf[UI == "orig.ident"]$fCL)) {
-      ggCol <- strsplit(sc1conf[UI == "orig.ident"]$fCL, "\\|")[[1]]
-      names(ggCol) <- levels(sc1meta$orig.ident)
-      ggLvl <- levels(sc1meta$orig.ident)[levels(sc1meta$orig.ident) %in% unique(sc1meta$orig.ident)]
-      sc1meta$orig.ident <- factor(sc1meta$orig.ident, levels = ggLvl)
-      ggCol <- ggCol[ggLvl]
-    }
+    # pick out axes
+    umap_x <- grep("UMAP|tSNE", names(sc1meta), value=TRUE)[1]
+    umap_y <- grep("UMAP|tSNE", names(sc1meta), value=TRUE)[2]
     
-    # Use plotly directly for better performance
-    plotly_obj <- plot_ly(
-      data = sc1meta,
-      x = ~get(umap_x),
-      y = ~get(umap_y),
-      type = "scatter",
-      mode = "markers",
+    # get the palette (or NULL if none defined)
+    pal <- get_palette_for_meta(input$sel_meta_col,
+                                sc1conf, sc1meta)
+    
+    plot_ly(
+      data   = sc1meta,
+      x      = ~get(umap_x),
+      y      = ~get(umap_y),
+      type   = "scatter",
+      mode   = "markers",
       marker = list(size = 5, opacity = 0.6),
-      color = ~orig.ident,
-      colors = ggCol,
-      text = ~orig.ident,
-      hoverinfo = "text",  # Show only the text in the tooltip
-      key = ~cellid,
-      source = "select_umap" 
+      color  = ~get(input$sel_meta_col),  # ggplotly will pick up the factor
+      colors = pal,                       # named vector or NULL
+      text     = ~paste0(input$sel_meta_col, ": ", get(input$sel_meta_col)),
+      hoverinfo= "text",
+      key      = ~cellid,
+      source   = "select_umap"
     ) %>%
-      layout(title = "Interactive UMAP", xaxis = list(title = umap_x), yaxis = list(title = umap_y), showlegend = FALSE)
-    plotly_obj <- event_register(plotly_obj, "plotly_selected")
-    plotly_obj
+      layout(
+        title  = paste("UMAP coloured by", input$sel_meta_col),
+        xaxis  = list(title       = umap_x,
+                      scaleanchor = "y",
+                      scaleratio  = 1),
+        yaxis  = list(title = umap_y),
+        showlegend = FALSE
+      ) %>%
+      event_register("plotly_selected")
   })
   
   
@@ -1320,7 +1350,7 @@ shinyServer(function(input, output, session) {
         t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
                     (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
         z <- (m1 - m_all) / sd_all
-        res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, tstat = t, zscore = z)
+        res[[i]] <- data.table(gene = g, avg_in = m1, avg_out = m2, tstat = t, zscore = z)
         n <- length(top_hvg)
         if (i %% 200 == 0 || i == n) incProgress(200 / n, detail = paste("Gene", i, "of", n))
       }

@@ -751,7 +751,7 @@ tabPanel(
       column(7, plotlyOutput("sel_umap", height = "600px"), 
              div(style="font-size:80%;color:#888;","Select cells with lasso, box or click tool.")),
       column(5, br(),
-             actionButton("do_marker", "Find markers for selection", icon = icon("magic")),
+             actionButton("do_marker", "Find markers for plot selection", icon = icon("magic")),
              br(),br(),
              # --- New: Metadata-based selection UI ---
              h5("Or select cells by metadata group:"),
