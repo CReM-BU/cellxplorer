@@ -753,6 +753,14 @@ tabPanel(
       column(5, br(),
              actionButton("do_marker", "Find markers for selection", icon = icon("magic")),
              br(),br(),
+             # --- New: Metadata-based selection UI ---
+             h5("Or select cells by metadata group:"),
+             selectInput("sel_meta_col", "Metadata column:",
+                         choices = sc1conf[grp == TRUE]$UI, selected = sc1conf[grp == TRUE]$UI[1]),
+             uiOutput("sel_meta_in_ui"),
+             uiOutput("sel_meta_out_ui"),
+             actionButton("do_marker_meta", "Find markers for metadata selection", icon = icon("magic")),
+             br(),br(),
              strong("Selection:"), textOutput("sel_ncells", inline=TRUE), br(),
              strong("Top markers:"),
              DT::dataTableOutput("sel_markers_tbl"),
@@ -771,7 +779,6 @@ p(a("Center for Regenerative Medicine of Boston University and Boston Medical Ce
 img(src='logo.png', height="12%", width="12%", align = "left"),
 )))
 
- 
- 
- 
- 
+
+
+

@@ -623,7 +623,6 @@ scBubbHeat <- function(inpConf, inpMeta, inp, inpGrp, inpPlt,
 
 
 
-
 ### Start server code 
 shinyServer(function(input, output, session) { 
   ### For all tags and Server-side selectize 
@@ -1248,6 +1247,95 @@ shinyServer(function(input, output, session) {
     })
   })
   
+  # --- New: Reactive for metadata-based selection ---
+  meta_sel_col_rv <- reactive({
+    req(input$sel_meta_col)
+    input$sel_meta_col
+  })
+
+  meta_sel_in_rv <- reactive({
+    req(input$sel_meta_in)
+    input$sel_meta_in
+  })
+
+  meta_sel_out_rv <- reactive({
+    req(input$sel_meta_out)
+    input$sel_meta_out
+  })
+  # renderUI for ingroup choices
+  output$sel_meta_in_ui <- renderUI({
+    req(input$sel_meta_col)
+    # grab the unique levels / values from that column
+    choices <- sort(unique(sc1meta[[ input$sel_meta_col ]]))
+    selectInput(
+      "sel_meta_in",
+      "In-group (one or more):",
+      choices  = choices,
+      selected = NULL,
+      multiple = TRUE
+    )
+  })
+
+  # renderUI for outgroup choices
+  output$sel_meta_out_ui <- renderUI({
+    req(input$sel_meta_col)
+    choices <- sort(unique(sc1meta[[ input$sel_meta_col ]]))
+    selectInput(
+      "sel_meta_out",
+      "Out-group (one or more):",
+      choices  = choices,
+      selected = NULL,
+      multiple = TRUE
+    )
+  })
+  observeEvent(input$do_marker_meta, {
+    withProgress(message = "Processing markers (metadata selection)...", value = 0, {
+      meta_col <- meta_sel_col_rv()
+      in_ids <- meta_sel_in_rv()
+      out_ids <- meta_sel_out_rv()
+      validate(need(length(in_ids) > 0, "Select at least one ingroup identity"))
+      validate(need(length(out_ids) > 0, "Select at least one outgroup identity"))
+      group1 <- which(sc1meta[[meta_col]] %in% in_ids)
+      group2 <- which(sc1meta[[meta_col]] %in% out_ids)
+      validate(need(length(group1) > 5, "Ingroup must have at least 5 cells"))
+      validate(need(length(group2) > 5, "Outgroup must have at least 5 cells"))
+
+      h5file <- H5File$new("sc1gexpr.h5", mode = "r")
+      h5data <- h5file[["grp"]][["data"]]
+      res <- vector("list", length(top_hvg))
+      for (i in seq_along(top_hvg)) {
+        g <- top_hvg[i]
+        gi <- sc1gene[[g]]
+        expr <- h5data$read(args = list(gi, quote(expr = )))
+        if (all(is.na(expr[group1])) || all(is.na(expr[group2]))) next
+        m1 <- mean(expr[group1], na.rm = TRUE)
+        m2 <- mean(expr[group2], na.rm = TRUE)
+        v1 <- var(expr[group1], na.rm = TRUE)
+        v2 <- var(expr[group2], na.rm = TRUE)
+        n1 <- sum(!is.na(expr[group1]))
+        n2 <- sum(!is.na(expr[group2]))
+        m_all <- mean(expr, na.rm = TRUE)
+        sd_all <- sd(expr, na.rm = TRUE)
+        if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) next
+        t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
+                    (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
+        z <- (m1 - m_all) / sd_all
+        res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, tstat = t, zscore = z)
+        n <- length(top_hvg)
+        if (i %% 200 == 0 || i == n) incProgress(200 / n, detail = paste("Gene", i, "of", n))
+      }
+      h5file$close_all()
+      res <- rbindlist(res, use.names = TRUE, fill = TRUE)
+      res <- res[order(-(tstat))][1:30]
+      numeric_cols <- sapply(res, is.numeric)
+      res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
+      marker_tbl_rv(res)
+      output$sel_markers_tbl <- DT::renderDT({
+        DT::datatable(res, options = list(dom = "t", pageLength = 30), rownames = FALSE)
+      })
+    })
+  })
+  
   output$sel_marker_dl <- downloadHandler(
     filename = function() "selector_markers.csv",
     content = function(file) {
@@ -1255,7 +1343,5 @@ shinyServer(function(input, output, session) {
     }
   )   
   
-}) 
-
-
+})
 
