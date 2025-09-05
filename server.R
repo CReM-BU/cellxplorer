@@ -1226,9 +1226,21 @@ shinyServer(function(input, output, session) {
   output$sel_umap <- renderPlotly({
     req(input$sel_meta_col)
     
-    # pick out axes
-    umap_x <- grep("UMAP|tSNE", names(sc1meta), value=TRUE)[1]
-    umap_y <- grep("UMAP|tSNE", names(sc1meta), value=TRUE)[2]
+    # Define the exact column names we want for the plot
+    desired_cols <- c("umap_1", "umap_2")
+    
+    # Check if both desired columns exist in the metadata
+    if (all(desired_cols %in% names(sc1meta))) {
+      # If they exist, use them
+      umap_x <- desired_cols[1]
+      umap_y <- desired_cols[2]
+    } else {
+      # Otherwise, fall back to the original, more general search
+      warning("Did not find 'umap_1' and 'umap_2'. Falling back to a general UMAP/tSNE search.")
+      umap_x <- grep("UMAP|tSNE", names(sc1meta), value = TRUE, ignore.case = TRUE)[1]
+      umap_y <- grep("UMAP|tSNE", names(sc1meta), value = TRUE, ignore.case = TRUE)[2]
+    }
+    
     
     # get the palette (or NULL if none defined)
     pal <- get_palette_for_meta(input$sel_meta_col,
