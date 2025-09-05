@@ -1509,7 +1509,7 @@ shinyServer(function(input, output, session) {
       )
     ggplot(df, aes(x = CombinedScore, y = reorder(TermWrap, CombinedScore))) +
       geom_col(fill = "#c43c37", width = 0.7) +
-      facet_wrap(~ LibShort, scales = "free_y", ncol = 2) +
+      facet_wrap(~ LibShort, scales = "free", ncol = 2) +
       labs(x = "Combined Score", y = NULL) +
       theme_minimal(base_size = 14) +
       theme(

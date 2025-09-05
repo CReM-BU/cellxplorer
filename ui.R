@@ -752,7 +752,7 @@ tabPanel(
              plotlyOutput("sel_umap", height = "600px"), 
              div(style="font-size:80%;color:#888;","Select cells with lasso, box or click tool."),
              hr(),
-             h4("Quick Enrichr results (top 200 genes)") %>%
+             h4("Enrichr results (using top 200 genes)") %>%
                helper(
                  type = "inline",
                  size = "m",
