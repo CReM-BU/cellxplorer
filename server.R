@@ -10,6 +10,10 @@ library(hdf5r)
 library(ggdendro) 
 library(gridExtra) 
 library(plotly)
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(stringr)
 
 sc1conf = readRDS("sc1conf.rds")
 sc1def  = readRDS("sc1def.rds")
@@ -1135,6 +1139,8 @@ shinyServer(function(input, output, session) {
   marker_tbl_rv     <- reactiveVal(NULL)
   sc1meta$cellid <- sc1meta$cellid %||% rownames(sc1meta)
 
+  #### Tab e1 specific functions
+
   get_palette_for_meta <- function(meta_col, sc1conf, sc1meta) {
     # find the row in sc1conf
     row <- sc1conf[UI == meta_col]
@@ -1164,6 +1170,59 @@ shinyServer(function(input, output, session) {
     pal_cols
   }
   
+  runEnrichr <- function(genes, 
+                        libraries = c("MSigDB_Hallmark_2020",
+                                      "GO_Biological_Process_2025",
+                                      "GO_Molecular_Function_2025",
+                                      "KEGG_2021_Human"),
+                        top_n     = 5) {
+    # collapse your gene vector into the \n‐delimited string that Enrichr expects
+    genes_str <- paste(genes, collapse = "\n")
+    payload   <- list(list = genes_str,
+                      description = "Shiny selector top 200")
+
+    # 1) submit
+    resp1 <- POST("https://maayanlab.cloud/Enrichr/addList",
+                  body   = payload,
+                  encode = "multipart")
+    stop_for_status(resp1)
+    ulid <- fromJSON(content(resp1, as = "text", encoding = "UTF-8"))$userListId
+
+    # 2) fetch each library
+    out <- lapply(libraries, function(lib) {
+      url <- sprintf("https://maayanlab.cloud/Enrichr/enrich?userListId=%s&backgroundType=%s",
+                    ulid, lib)
+      resp2 <- GET(url)
+      stop_for_status(resp2)
+      js <- fromJSON(content(resp2, as = "text", encoding = "UTF-8"))
+      res <- js[[lib]]
+      if (is.null(res)) return(NULL)
+      # each entry is a length‐>6 list: rank, term, pval, odds, combined, [gene vector]
+      df <- data.frame(
+        Rank          = sapply(res, `[[`, 1),
+        Term          = sapply(res, `[[`, 2),
+        Pvalue        = sapply(res, `[[`, 3),
+        OddsRatio     = sapply(res, `[[`, 4),
+        CombinedScore = sapply(res, `[[`, 5),
+        Genes         = I(lapply(res, `[[`, 6)),
+        stringsAsFactors = FALSE
+      )
+      df$Library <- lib
+      # keep only the top_n by P‐value
+      df %>%
+        arrange(Pvalue) %>%
+        slice_head(n = top_n)
+    })
+
+    # bind and return (dropping any NULL libraries)
+    bind_rows(out)
+
+  }
+
+  # Enrichr Reactive value:
+  enrichr_res_rv <- reactiveVal(NULL)
+
+
   output$sel_umap <- renderPlotly({
     req(input$sel_meta_col)
     
@@ -1210,11 +1269,14 @@ shinyServer(function(input, output, session) {
   
   observeEvent(input$do_marker, {
     withProgress(message = "Processing markers...", value = 0, {
+      # clear previous Enrichr results to force refresh even if identical genes
+      enrichr_res_rv(NULL)
       ids <- selected_cells_rv()
-      validate(need(!is.null(ids) && length(ids) > 5, "Select at least 5 cells"))
+      shiny::validate(shiny::need(!is.null(ids) && length(ids) > 5, "Select at least 5 cells"))
       
-      group1 <- as.numeric(ids)
-      group2 <- as.numeric(setdiff(seq_len(nrow(sc1meta)), ids))
+      # Map selected keys to row indices robustly (works for non-numeric cell IDs)
+      group1 <- which(sc1meta$cellid %in% ids)
+      group2 <- setdiff(seq_len(nrow(sc1meta)), group1)
       req(length(group2) > 5)
       
       h5file <- H5File$new("sc1gexpr.h5", mode = "r")
@@ -1265,12 +1327,32 @@ shinyServer(function(input, output, session) {
       
       # Combine results and sort
       res <- rbindlist(res, use.names = TRUE, fill = TRUE)
-      res <- res[order(-(tstat))][1:30]
+      if (is.null(res) || nrow(res) == 0) {
+        enrichr_res_rv(NULL)
+        marker_tbl_rv(NULL)
+        shiny::showNotification("No marker statistics could be computed for the selection.", type = "error")
+        return(NULL)
+      }
+      # rank genes and run Enrichr on the top 200 genes
+      res_sorted <- res[order(-(tstat))]
+      top200 <- head(res_sorted$gene, 200)
+      if (length(top200) > 1) {
+        # try/catch so we do not leave stale plots on transient API errors
+        enr <- tryCatch(runEnrichr(top200), error = function(e) {
+          shiny::showNotification("Enrichr request failed. Please retry.", type = "error")
+          NULL
+        })
+        enrichr_res_rv(enr)
+      } else {
+        enrichr_res_rv(NULL)
+      }
+      res <- res_sorted[1:30]
       # Round numeric columns to 3 decimal places
       numeric_cols <- sapply(res, is.numeric)
       res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
       
       marker_tbl_rv(res)
+
       output$sel_markers_tbl <- DT::renderDT({
         DT::datatable(res, options = list(dom = "t", pageLength = 30), rownames = FALSE)
       })
@@ -1320,15 +1402,17 @@ shinyServer(function(input, output, session) {
   })
   observeEvent(input$do_marker_meta, {
     withProgress(message = "Processing markers (metadata selection)...", value = 0, {
+      # clear previous Enrichr results to force refresh even if identical genes
+      enrichr_res_rv(NULL)
       meta_col <- meta_sel_col_rv()
       in_ids <- meta_sel_in_rv()
       out_ids <- meta_sel_out_rv()
-      validate(need(length(in_ids) > 0, "Select at least one ingroup identity"))
-      validate(need(length(out_ids) > 0, "Select at least one outgroup identity"))
+      shiny::validate(shiny::need(length(in_ids) > 0, "Select at least one ingroup identity"))
+      shiny::validate(shiny::need(length(out_ids) > 0, "Select at least one outgroup identity"))
       group1 <- which(sc1meta[[meta_col]] %in% in_ids)
       group2 <- which(sc1meta[[meta_col]] %in% out_ids)
-      validate(need(length(group1) > 5, "Ingroup must have at least 5 cells"))
-      validate(need(length(group2) > 5, "Outgroup must have at least 5 cells"))
+      shiny::validate(shiny::need(length(group1) > 5, "Ingroup must have at least 5 cells"))
+      shiny::validate(shiny::need(length(group2) > 5, "Outgroup must have at least 5 cells"))
 
       h5file <- H5File$new("sc1gexpr.h5", mode = "r")
       h5data <- h5file[["grp"]][["data"]]
@@ -1356,7 +1440,25 @@ shinyServer(function(input, output, session) {
       }
       h5file$close_all()
       res <- rbindlist(res, use.names = TRUE, fill = TRUE)
-      res <- res[order(-(tstat))][1:30]
+      if (is.null(res) || nrow(res) == 0) {
+        enrichr_res_rv(NULL)
+        marker_tbl_rv(NULL)
+        shiny::showNotification("No marker statistics could be computed for the metadata selection.", type = "error")
+        return(NULL)
+      }
+      # rank genes by t-stat before selecting top 200 for Enrichr
+      res_sorted <- res[order(-(tstat))]
+      top200 <- head(res_sorted$gene, 200)
+      if (length(top200) > 1) {
+        enr <- tryCatch(runEnrichr(top200), error = function(e) {
+          shiny::showNotification("Enrichr request failed. Please retry.", type = "error")
+          NULL
+        })
+        enrichr_res_rv(enr)
+      } else {
+        enrichr_res_rv(NULL)
+      }
+      res <- res_sorted[1:30]
       numeric_cols <- sapply(res, is.numeric)
       res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
       marker_tbl_rv(res)
@@ -1373,5 +1475,49 @@ shinyServer(function(input, output, session) {
     }
   )   
   
+  # Enrichr reactive table and plot
+  output$enrichr_table <- DT::renderDT({
+    df <- enrichr_res_rv()
+    req(df)
+    # if you want a comma‐joined genes column:
+    df$GeneList <- sapply(df$Genes, paste, collapse = ", ")
+    out <- df %>% select(Library, Term, Pvalue, CombinedScore, GeneList)
+    out$Pvalue <- as.numeric(formatC(out$Pvalue, format = "e", digits = 3))
+
+    DT::datatable(
+      out,
+      rownames = FALSE,
+      options = list(pageLength = 10, scrollX = TRUE)
+    ) %>%
+      DT::formatRound(
+      columns = "CombinedScore",
+      digits = 3
+    )
+  })
+
+  output$enrichr_plot <- renderPlot({
+    df <- enrichr_res_rv()
+    req(df)
+    df <- df %>%
+      mutate(
+        TermWrap  = stringr::str_wrap(Term, width = 40),
+        LibShort  = recode(Library,
+                          MSigDB_Hallmark_2020           = "Hallmarks",
+                          GO_Biological_Process_2025     = "GO_BP",
+                          GO_Molecular_Function_2025     = "GO_MF",
+                          KEGG_2021_Human                 = "KEGG_2021")
+      )
+    ggplot(df, aes(x = CombinedScore, y = reorder(TermWrap, CombinedScore))) +
+      geom_col(fill = "#c43c37", width = 0.7) +
+      facet_wrap(~ LibShort, scales = "free_y", ncol = 2) +
+      labs(x = "Combined Score", y = NULL) +
+      theme_minimal(base_size = 14) +
+      theme(
+        strip.text    = element_text(face = "bold", size = 14),
+        axis.text.y   = element_text(size = 10),
+        panel.grid.major.y = element_blank()
+      )
+  })
+
 })
 

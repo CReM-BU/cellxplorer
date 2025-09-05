@@ -748,8 +748,33 @@ tabPanel(
     h4("Interactive cell selection and marker discovery"),
     p("Lasso cells on UMAP to discover markers vs all other cells (top 3000 HVGs)", style="font-size:90%;color:grey;"),
     fluidRow(
-      column(7, plotlyOutput("sel_umap", height = "600px"), 
-             div(style="font-size:80%;color:#888;","Select cells with lasso, box or click tool.")),
+      column(7,
+             plotlyOutput("sel_umap", height = "600px"), 
+             div(style="font-size:80%;color:#888;","Select cells with lasso, box or click tool."),
+             hr(),
+             h4("Quick Enrichr results (top 200 genes)") %>%
+               helper(
+                 type = "inline",
+                 size = "m",
+                 fade = TRUE,
+                 title = "Enrichr Results",
+                 content = c(
+                   "Enrichr is a gene set enrichment analysis tool.",
+                   "This section displays enrichment results for the top 200 marker genes from your selection.",
+                   "You can view enriched pathways, GO terms, and other gene sets relevant to your selected cells."
+                 )
+               ),
+             tabsetPanel(
+               tabPanel(
+                 "Table",
+                 DT::DTOutput("enrichr_table")
+               ),
+               tabPanel(
+                 "Barplots",
+                 plotOutput("enrichr_plot", height = "600px")
+               )
+             )
+      ),
       column(5, br(),
              actionButton("do_marker", "Find markers for plot selection", icon = icon("magic")),
              br(),br(),
@@ -765,7 +790,8 @@ tabPanel(
              strong("Top markers:"),
              DT::dataTableOutput("sel_markers_tbl"),
              br(),
-             downloadButton("sel_marker_dl", "Download table"))
+             downloadButton("sel_marker_dl", "Download table")
+             )
     ) # End of fluidRow (4 space) 
   ) # End of tab (2 space)
    ,    
