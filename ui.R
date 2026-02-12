@@ -755,11 +755,11 @@ tabPanel(
   tabPanel(
     HTML("Selector"),
     h4("Interactive cell selection and marker discovery"),
-    p("Lasso cells on UMAP to discover markers vs all other cells (top 3000 HVGs)", style="font-size:90%;color:grey;"),
+    p("Lasso cells on UMAP to discover markers (top 3000 HVGs). Hold Shift and draw a second lasso to define an explicit outgroup.", style="font-size:90%;color:grey;"),
     fluidRow(
       column(7,
              plotlyOutput("sel_umap", height = "600px"), 
-             div(style="font-size:80%;color:#888;","Select cells with lasso, box or click tool."),
+             div(style="font-size:80%;color:#888;","Select cells with lasso or box tool. Hold Shift and draw a second selection to define an outgroup. A new ingroup selection automatically resets both groups. Double-click to clear all selections."),
              hr(),
              h4("Enrichr results (using top 200 genes)") %>%
                helper(

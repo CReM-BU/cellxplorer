@@ -1165,8 +1165,12 @@ shinyServer(function(input, output, session) {
   top_hvg <- intersect(top_hvg, names(sc1gene)) 
   
   selected_cells_rv <- reactive({
-    sel <- event_data("plotly_selected", source = "select_umap")
-    if (is.null(sel) || nrow(sel) == 0) NULL else sel$key
+    ids <- input$sel_ingroup_keys
+    if (is.null(ids) || length(ids) == 0) NULL else ids
+  })
+  outgroup_cells_rv <- reactive({
+    ids <- input$sel_outgroup_keys
+    if (is.null(ids) || length(ids) == 0) NULL else ids
   })
   marker_tbl_rv     <- reactiveVal(NULL)
   sc1meta$cellid <- sc1meta$cellid %||% rownames(sc1meta)
@@ -1257,27 +1261,24 @@ shinyServer(function(input, output, session) {
 
   output$sel_umap <- renderPlotly({
     req(input$sel_meta_col)
-    
+
     # Define the exact column names we want for the plot
     desired_cols <- c("umap_1", "umap_2")
-    
+
     # Check if both desired columns exist in the metadata
     if (all(desired_cols %in% names(sc1meta))) {
-      # If they exist, use them
       umap_x <- desired_cols[1]
       umap_y <- desired_cols[2]
     } else {
-      # Otherwise, fall back to the original, more general search
       warning("Did not find 'umap_1' and 'umap_2'. Falling back to a general UMAP/tSNE search.")
       umap_x <- grep("UMAP|tSNE", names(sc1meta), value = TRUE, ignore.case = TRUE)[1]
       umap_y <- grep("UMAP|tSNE", names(sc1meta), value = TRUE, ignore.case = TRUE)[2]
     }
-    
-    
+
     # get the palette (or NULL if none defined)
     pal <- get_palette_for_meta(input$sel_meta_col,
                                 sc1conf, sc1meta)
-    
+
     plot_ly(
       data   = sc1meta,
       x      = ~get(umap_x),
@@ -1285,11 +1286,12 @@ shinyServer(function(input, output, session) {
       type   = "scatter",
       mode   = "markers",
       marker = list(size = 5, opacity = 0.6),
-      color  = ~get(input$sel_meta_col),  # ggplotly will pick up the factor
-      colors = pal,                       # named vector or NULL
+      color  = ~get(input$sel_meta_col),
+      colors = pal,
       text     = ~paste0(input$sel_meta_col, ": ", get(input$sel_meta_col)),
       hoverinfo= "text",
       key      = ~cellid,
+      customdata = ~cellid,
       source   = "select_umap"
     ) %>%
       layout(
@@ -1298,17 +1300,146 @@ shinyServer(function(input, output, session) {
                       scaleanchor = "y",
                       scaleratio  = 1),
         yaxis  = list(title = umap_y),
-        showlegend = FALSE
+        showlegend = FALSE,
+        dragmode = "lasso"
       ) %>%
-      event_register("plotly_selected")
+      event_register("plotly_selected") %>%
+      htmlwidgets::onRender("
+function(el, x) {
+  var shiftHeld = false;
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Shift') shiftHeld = true;
+  });
+  document.addEventListener('keyup', function(e) {
+    if (e.key === 'Shift') shiftHeld = false;
+  });
+
+  var ingroupKeys = [];
+  var outgroupKeys = [];
+  var ingroupShapeData = null;
+  var outgroupShapes = [];
+  var lastDrawnPath = null;
+
+  Shiny.setInputValue('sel_ingroup_keys', null, {priority: 'event'});
+  Shiny.setInputValue('sel_outgroup_keys', null, {priority: 'event'});
+
+  function buildPathInfo(lassoPoints, range) {
+    if (lassoPoints && lassoPoints.x && lassoPoints.x.length > 2) {
+      var d = 'M' + lassoPoints.x[0] + ',' + lassoPoints.y[0];
+      for (var i = 1; i < lassoPoints.x.length; i++) {
+        d += 'L' + lassoPoints.x[i] + ',' + lassoPoints.y[i];
+      }
+      d += 'Z';
+      var maxY = -Infinity, maxIdx = 0;
+      for (var i = 0; i < lassoPoints.y.length; i++) {
+        if (lassoPoints.y[i] > maxY) { maxY = lassoPoints.y[i]; maxIdx = i; }
+      }
+      return {svgPath: d, labelX: lassoPoints.x[maxIdx], labelY: maxY};
+    } else if (range && range.x && range.y) {
+      var x0 = range.x[0], x1 = range.x[1];
+      var y0 = range.y[0], y1 = range.y[1];
+      var d = 'M'+x0+','+y0+'L'+x1+','+y0+'L'+x1+','+y1+'L'+x0+','+y1+'Z';
+      return {svgPath: d, labelX: (x0+x1)/2, labelY: Math.max(y0,y1)};
+    }
+    return null;
+  }
+
+  function updateVisuals() {
+    var shapes = [];
+    var annotations = [];
+    if (ingroupShapeData) {
+      shapes.push({
+        type: 'path', path: ingroupShapeData.svgPath,
+        fillcolor: 'rgba(205, 92, 92, 0.15)',
+        line: {color: 'rgba(178, 34, 34, 0.6)', width: 2},
+        xref: 'x', yref: 'y'
+      });
+      annotations.push({
+        x: ingroupShapeData.labelX, y: ingroupShapeData.labelY,
+        text: '<b>Ingroup</b>',
+        showarrow: false,
+        font: {color: 'rgb(178, 34, 34)', size: 14},
+        xref: 'x', yref: 'y', yshift: 15
+      });
+    }
+    for (var j = 0; j < outgroupShapes.length; j++) {
+      var s = outgroupShapes[j];
+      shapes.push({
+        type: 'path', path: s.svgPath,
+        fillcolor: 'rgba(100, 149, 237, 0.15)',
+        line: {color: 'rgba(70, 130, 180, 0.6)', width: 2},
+        xref: 'x', yref: 'y'
+      });
+      if (j === 0) {
+        annotations.push({
+          x: s.labelX, y: s.labelY,
+          text: '<b>Outgroup</b>',
+          showarrow: false,
+          font: {color: 'rgb(70, 130, 180)', size: 14},
+          xref: 'x', yref: 'y', yshift: 15
+        });
+      }
+    }
+    Plotly.relayout(el, {shapes: shapes, annotations: annotations});
+  }
+
+  // Capture the lasso/box path during each drag operation
+  el.on('plotly_selecting', function(eventData) {
+    if (eventData) {
+      var p = buildPathInfo(eventData.lassoPoints, eventData.range);
+      if (p) lastDrawnPath = p;
+    }
+  });
+
+  el.on('plotly_selected', function(eventData) {
+    if (!eventData || !eventData.points || eventData.points.length === 0) return;
+    var allKeys = eventData.points.map(function(pt) { return pt.customdata; });
+    // Use path captured during drag; fall back to event data
+    var pathInfo = lastDrawnPath || buildPathInfo(eventData.lassoPoints, eventData.range);
+    lastDrawnPath = null;
+
+    if (shiftHeld && ingroupKeys.length > 0) {
+      outgroupKeys = allKeys.filter(function(k) {
+        return ingroupKeys.indexOf(k) < 0;
+      });
+      if (pathInfo) outgroupShapes.push(pathInfo);
+    } else {
+      ingroupKeys = allKeys;
+      outgroupKeys = [];
+      ingroupShapeData = pathInfo;
+      outgroupShapes = [];
+    }
+
+    updateVisuals();
+    Shiny.setInputValue('sel_ingroup_keys', ingroupKeys, {priority: 'event'});
+    Shiny.setInputValue('sel_outgroup_keys', outgroupKeys, {priority: 'event'});
+  });
+
+  el.on('plotly_deselect', function() {
+    ingroupKeys = [];
+    outgroupKeys = [];
+    ingroupShapeData = null;
+    outgroupShapes = [];
+    lastDrawnPath = null;
+    updateVisuals();
+    Shiny.setInputValue('sel_ingroup_keys', null, {priority: 'event'});
+    Shiny.setInputValue('sel_outgroup_keys', null, {priority: 'event'});
+  });
+}
+      ")
   })
   
   
   output$sel_ncells <- renderText({
     ids <- selected_cells_rv()
-    print(c("Selected cell IDs:", ids))  # Debug: Print selected cell IDs
-    if (is.null(ids)) "None selected"
-    else paste(length(ids), "cells")
+    out_ids <- outgroup_cells_rv()
+    if (is.null(ids)) {
+      "None selected"
+    } else if (!is.null(out_ids) && length(out_ids) > 0) {
+      paste0("Ingroup: ", length(ids), " cells | Outgroup: ", length(out_ids), " cells")
+    } else {
+      paste0(length(ids), " cells (vs all other cells)")
+    }
   })
   
   observeEvent(input$do_marker, {
@@ -1317,11 +1448,17 @@ shinyServer(function(input, output, session) {
       enrichr_res_rv(NULL)
       ids <- selected_cells_rv()
       shiny::validate(shiny::need(!is.null(ids) && length(ids) > 5, "Select at least 5 cells"))
-      
+
       # Map selected keys to row indices robustly (works for non-numeric cell IDs)
       group1 <- which(sc1meta$cellid %in% ids)
-      group2 <- setdiff(seq_len(nrow(sc1meta)), group1)
-      req(length(group2) > 5)
+      outgroup_ids <- outgroup_cells_rv()
+      if (!is.null(outgroup_ids) && length(outgroup_ids) > 0) {
+        group2 <- which(sc1meta$cellid %in% outgroup_ids)
+        shiny::validate(shiny::need(length(group2) > 5, "Outgroup must have at least 5 cells"))
+      } else {
+        group2 <- setdiff(seq_len(nrow(sc1meta)), group1)
+        req(length(group2) > 5)
+      }
       
       h5file <- H5File$new("sc1gexpr.h5", mode = "r")
       h5data <- h5file[["grp"]][["data"]]
