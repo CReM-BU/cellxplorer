@@ -386,53 +386,85 @@ scDRcoexNum <- function(inpConf, inpMeta, inp1, inp2,
 } 
 
 # Plot violin / boxplot 
-scVioBox <- function(inpConf, inpMeta, inp1, inp2, 
-                     inpsub1, inpsub2, inpH5, inpGene, 
-                     inptyp, inppts, inpsiz, inpfsz){ 
-  if(is.null(inpsub1)){inpsub1 = inpConf$UI[1]} 
-  # Prepare ggData 
-  ggData = inpMeta[, c(inpConf[UI == inp1]$ID, inpConf[UI == inpsub1]$ID), 
-                   with = FALSE] 
-  colnames(ggData) = c("X", "sub") 
-  
+scVioBox <- function(inpConf, inpMeta, inp1, inp1b, inp2,
+                     inpsub1, inpsub2, inpH5, inpGene,
+                     inptyp, inppts, inpsiz, inpfsz){
+  if(is.null(inpsub1)){inpsub1 = inpConf$UI[1]}
+
+  # Check if secondary grouping is enabled
+  useFill = !is.null(inp1b) && inp1b != "(none)" && inp1b %in% inpConf$UI
+
+  # Prepare ggData
+  if(useFill){
+    ggData = inpMeta[, c(inpConf[UI == inp1]$ID, inpConf[UI == inp1b]$ID, inpConf[UI == inpsub1]$ID),
+                     with = FALSE]
+    colnames(ggData) = c("X", "X2", "sub")
+  } else {
+    ggData = inpMeta[, c(inpConf[UI == inp1]$ID, inpConf[UI == inpsub1]$ID),
+                     with = FALSE]
+    colnames(ggData) = c("X", "sub")
+  }
+
   # Load in either cell meta or gene expr
-  if(inp2 %in% inpConf$UI){ 
-    ggData$val = inpMeta[[inpConf[UI == inp2]$ID]] 
-  } else { 
-    h5file <- H5File$new(inpH5, mode = "r") 
-    h5data <- h5file[["grp"]][["data"]] 
-    ggData$val = h5data$read(args = list(inpGene[inp2], quote(expr=))) 
-    ggData[val < 0]$val = 0 
-    set.seed(42) 
-    tmpNoise = rnorm(length(ggData$val)) * diff(range(ggData$val)) / 1000 
-    ggData$val = ggData$val + tmpNoise 
-    h5file$close_all() 
-  } 
-  if(length(inpsub2) != 0 & length(inpsub2) != nlevels(ggData$sub)){ 
-    ggData = ggData[sub %in% inpsub2] 
-  } 
-  
-  # Do factoring 
-  ggCol = strsplit(inpConf[UI == inp1]$fCL, "\\|")[[1]] 
-  names(ggCol) = levels(ggData$X) 
-  ggLvl = levels(ggData$X)[levels(ggData$X) %in% unique(ggData$X)] 
-  ggData$X = factor(ggData$X, levels = ggLvl) 
-  ggCol = ggCol[ggLvl] 
-  
-  # Actual ggplot 
-  if(inptyp == "violin"){ 
-    ggOut = ggplot(ggData, aes(X, val, fill = X)) + geom_violin(scale = "width") 
-  } else { 
-    ggOut = ggplot(ggData, aes(X, val, fill = X)) + geom_boxplot() 
-  } 
-  if(inppts){ 
-    ggOut = ggOut + geom_jitter(size = inpsiz, shape = 16) 
-  } 
-  ggOut = ggOut + xlab(inp1) + ylab(inp2) + 
-    sctheme(base_size = sList[inpfsz], Xang = 45, XjusH = 1) +  
-    scale_fill_manual("", values = ggCol) +
-    theme(legend.position = "none")
-  return(ggOut) 
+  if(inp2 %in% inpConf$UI){
+    ggData$val = inpMeta[[inpConf[UI == inp2]$ID]]
+  } else {
+    h5file <- H5File$new(inpH5, mode = "r")
+    h5data <- h5file[["grp"]][["data"]]
+    ggData$val = h5data$read(args = list(inpGene[inp2], quote(expr=)))
+    ggData[val < 0]$val = 0
+    set.seed(42)
+    tmpNoise = rnorm(length(ggData$val)) * diff(range(ggData$val)) / 1000
+    ggData$val = ggData$val + tmpNoise
+    h5file$close_all()
+  }
+  if(length(inpsub2) != 0 & length(inpsub2) != nlevels(ggData$sub)){
+    ggData = ggData[sub %in% inpsub2]
+  }
+
+  # Do factoring for X-axis
+  ggCol = strsplit(inpConf[UI == inp1]$fCL, "\\|")[[1]]
+  names(ggCol) = levels(ggData$X)
+  ggLvl = levels(ggData$X)[levels(ggData$X) %in% unique(ggData$X)]
+  ggData$X = factor(ggData$X, levels = ggLvl)
+  ggCol = ggCol[ggLvl]
+
+  # Do factoring for fill variable if secondary grouping is enabled
+  if(useFill){
+    ggCol2 = strsplit(inpConf[UI == inp1b]$fCL, "\\|")[[1]]
+    names(ggCol2) = levels(ggData$X2)
+    ggLvl2 = levels(ggData$X2)[levels(ggData$X2) %in% unique(ggData$X2)]
+    ggData$X2 = factor(ggData$X2, levels = ggLvl2)
+    ggCol2 = ggCol2[ggLvl2]
+  }
+
+  # Actual ggplot
+  if(useFill){
+    if(inptyp == "violin"){
+      ggOut = ggplot(ggData, aes(X, val, fill = X2)) + geom_violin(scale = "width")
+    } else {
+      ggOut = ggplot(ggData, aes(X, val, fill = X2)) + geom_boxplot()
+    }
+  } else {
+    if(inptyp == "violin"){
+      ggOut = ggplot(ggData, aes(X, val, fill = X)) + geom_violin(scale = "width")
+    } else {
+      ggOut = ggplot(ggData, aes(X, val, fill = X)) + geom_boxplot()
+    }
+  }
+  if(inppts){
+    ggOut = ggOut + geom_jitter(size = inpsiz, shape = 16)
+  }
+  ggOut = ggOut + xlab(inp1) + ylab(inp2) +
+    sctheme(base_size = sList[inpfsz], Xang = 45, XjusH = 1)
+
+  if(useFill){
+    ggOut = ggOut + scale_fill_manual(inp1b, values = ggCol2)
+  } else {
+    ggOut = ggOut + scale_fill_manual("", values = ggCol) +
+      theme(legend.position = "none")
+  }
+  return(ggOut)
 } 
 
 # Plot proportion plot 
@@ -995,34 +1027,34 @@ shinyServer(function(input, output, session) {
     updateCheckboxGroupInput(session, inputId = "sc1c1sub2", label = "Select which cells to show", 
                              choices = sub, selected = sub, inline = TRUE) 
   }) 
-  output$sc1c1oup <- renderPlot({ 
-    scVioBox(sc1conf, sc1meta, input$sc1c1inp1, input$sc1c1inp2, 
-             input$sc1c1sub1, input$sc1c1sub2, 
-             "sc1gexpr.h5", sc1gene, input$sc1c1typ, input$sc1c1pts, 
-             input$sc1c1siz, input$sc1c1fsz) 
+  output$sc1c1oup <- renderPlot({
+    scVioBox(sc1conf, sc1meta, input$sc1c1inp1, input$sc1c1inp1b, input$sc1c1inp2,
+             input$sc1c1sub1, input$sc1c1sub2,
+             "sc1gexpr.h5", sc1gene, input$sc1c1typ, input$sc1c1pts,
+             input$sc1c1siz, input$sc1c1fsz)
   }) 
   output$sc1c1oup.ui <- renderUI({ 
     plotOutput("sc1c1oup", height = pList2[input$sc1c1psz]) 
   }) 
-  output$sc1c1oup.pdf <- downloadHandler( 
-    filename = function() { paste0("sc1",input$sc1c1typ,"_",input$sc1c1inp1,"_",  
-                                   input$sc1c1inp2,".pdf") }, 
-    content = function(file) { ggsave( 
-      file, device = "pdf", height = input$sc1c1oup.h, width = input$sc1c1oup.w, useDingbats = FALSE, 
-      plot = scVioBox(sc1conf, sc1meta, input$sc1c1inp1, input$sc1c1inp2, 
-                      input$sc1c1sub1, input$sc1c1sub2, 
-                      "sc1gexpr.h5", sc1gene, input$sc1c1typ, input$sc1c1pts, 
-                      input$sc1c1siz, input$sc1c1fsz) ) 
+  output$sc1c1oup.pdf <- downloadHandler(
+    filename = function() { paste0("sc1",input$sc1c1typ,"_",input$sc1c1inp1,"_",
+                                   input$sc1c1inp2,".pdf") },
+    content = function(file) { ggsave(
+      file, device = "pdf", height = input$sc1c1oup.h, width = input$sc1c1oup.w, useDingbats = FALSE,
+      plot = scVioBox(sc1conf, sc1meta, input$sc1c1inp1, input$sc1c1inp1b, input$sc1c1inp2,
+                      input$sc1c1sub1, input$sc1c1sub2,
+                      "sc1gexpr.h5", sc1gene, input$sc1c1typ, input$sc1c1pts,
+                      input$sc1c1siz, input$sc1c1fsz) )
     }) 
-  output$sc1c1oup.png <- downloadHandler( 
-    filename = function() { paste0("sc1",input$sc1c1typ,"_",input$sc1c1inp1,"_",  
-                                   input$sc1c1inp2,".png") }, 
-    content = function(file) { ggsave( 
-      file, device = "png", height = input$sc1c1oup.h, width = input$sc1c1oup.w, 
-      plot = scVioBox(sc1conf, sc1meta, input$sc1c1inp1, input$sc1c1inp2, 
-                      input$sc1c1sub1, input$sc1c1sub2, 
-                      "sc1gexpr.h5", sc1gene, input$sc1c1typ, input$sc1c1pts, 
-                      input$sc1c1siz, input$sc1c1fsz) ) 
+  output$sc1c1oup.png <- downloadHandler(
+    filename = function() { paste0("sc1",input$sc1c1typ,"_",input$sc1c1inp1,"_",
+                                   input$sc1c1inp2,".png") },
+    content = function(file) { ggsave(
+      file, device = "png", height = input$sc1c1oup.h, width = input$sc1c1oup.w,
+      plot = scVioBox(sc1conf, sc1meta, input$sc1c1inp1, input$sc1c1inp1b, input$sc1c1inp2,
+                      input$sc1c1sub1, input$sc1c1sub2,
+                      "sc1gexpr.h5", sc1gene, input$sc1c1typ, input$sc1c1pts,
+                      input$sc1c1siz, input$sc1c1fsz) )
     }) 
   
   

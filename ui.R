@@ -553,19 +553,28 @@ navbarPage(
    fluidRow( 
      column( 
        3, style="border-right: 2px solid black", 
-       selectInput("sc1c1inp1", "Cell information (X-axis):", 
-                   choices = sc1conf[grp == TRUE]$UI, 
-                   selected = sc1def$grp1) %>%  
-         helper(type = "inline", size = "m", fade = TRUE, 
-                title = "Cell information to group cells by",  
-                content = c("Select categorical cell information to group cells by",  
-                            "- Single cells are grouped by this categorical covariate",  
-                            "- Plotted as the X-axis of the violin plot / box plot")),  
-       selectInput("sc1c1inp2", "Cell Info / Gene name (Y-axis):", choices=NULL) %>%  
-         helper(type = "inline", size = "m", fade = TRUE, 
-                title = "Cell Info / Gene to plot", 
-                content = c("Select cell info / gene to plot on Y-axis", 
-                            "- Can be continuous cell information (e.g. nUMIs / scores)", 
+       selectInput("sc1c1inp1", "Cell information (X-axis):",
+                   choices = sc1conf[grp == TRUE]$UI,
+                   selected = sc1def$grp1) %>%
+         helper(type = "inline", size = "m", fade = TRUE,
+                title = "Cell information to group cells by",
+                content = c("Select categorical cell information to group cells by",
+                            "- Single cells are grouped by this categorical covariate",
+                            "- Plotted as the X-axis of the violin plot / box plot")),
+       selectInput("sc1c1inp1b", "Cell information (X-axis fill, optional):",
+                   choices = c("(none)", sc1conf[grp == TRUE]$UI),
+                   selected = "(none)") %>%
+         helper(type = "inline", size = "m", fade = TRUE,
+                title = "Secondary grouping variable (optional)",
+                content = c("Select a second categorical variable for double grouping",
+                            "- When selected, cells are grouped by the first variable on X-axis",
+                            "- And colored/filled by this second variable",
+                            "- Leave as '(none)' for single grouping")),
+       selectInput("sc1c1inp2", "Cell Info / Gene name (Y-axis):", choices=NULL) %>%
+         helper(type = "inline", size = "m", fade = TRUE,
+                title = "Cell Info / Gene to plot",
+                content = c("Select cell info / gene to plot on Y-axis",
+                            "- Can be continuous cell information (e.g. nUMIs / scores)",
                             "- Can also be gene expression")), 
        radioButtons("sc1c1typ", "Plot type:", 
                     choices = c("violin", "boxplot"), 
