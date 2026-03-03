@@ -1484,9 +1484,6 @@ function(el, x) {
         v2 <- var(expr[group2], na.rm = TRUE)
         n1 <- sum(!is.na(expr[group1]))
         n2 <- sum(!is.na(expr[group2]))
-        m_all <- mean(expr, na.rm = TRUE)
-        sd_all <- sd(expr, na.rm = TRUE)    
-        
         # Skip if mean or variance is NA
         if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) {
           next
@@ -1494,8 +1491,9 @@ function(el, x) {
         
         t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
                     (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
-        
-        z <-  (m1 - m_all) / sd_all
+        pooled_sd <- sqrt((((n1 - 1) * v1) + ((n2 - 1) * v2)) / pmax(n1 + n2 - 2, 1))
+        z <- ifelse(n1 < 2 | n2 < 2 | is.na(pooled_sd) | pooled_sd == 0, NA_real_,
+                    (m1 - m2) / (pooled_sd + 1e-8))
         
         res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, tstat = t, zscore = z)
         
@@ -1609,12 +1607,12 @@ function(el, x) {
         v2 <- var(expr[group2], na.rm = TRUE)
         n1 <- sum(!is.na(expr[group1]))
         n2 <- sum(!is.na(expr[group2]))
-        m_all <- mean(expr, na.rm = TRUE)
-        sd_all <- sd(expr, na.rm = TRUE)
         if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) next
         t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
                     (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
-        z <- (m1 - m_all) / sd_all
+        pooled_sd <- sqrt((((n1 - 1) * v1) + ((n2 - 1) * v2)) / pmax(n1 + n2 - 2, 1))
+        z <- ifelse(n1 < 2 | n2 < 2 | is.na(pooled_sd) | pooled_sd == 0, NA_real_,
+                    (m1 - m2) / (pooled_sd + 1e-8))
         res[[i]] <- data.table(gene = g, avg_in = m1, avg_out = m2, tstat = t, zscore = z)
         n <- length(top_hvg)
         if (i %% 200 == 0 || i == n) incProgress(200 / n, detail = paste("Gene", i, "of", n))
@@ -1701,4 +1699,3 @@ function(el, x) {
   })
 
 })
-
