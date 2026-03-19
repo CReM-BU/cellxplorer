@@ -20,6 +20,84 @@ sc1def  = readRDS("sc1def.rds")
 sc1gene = readRDS("sc1gene.rds")
 sc1meta = readRDS("sc1meta.rds")
 
+sc1meta$cellid <- if ("cellid" %in% names(sc1meta)) {
+  as.character(sc1meta$cellid)
+} else {
+  rownames(sc1meta)
+}
+
+gene_idx <- as.integer(sc1gene)
+genes_by_idx <- names(sc1gene)[order(gene_idx)]
+cellid_lookup <- sc1meta$cellid
+
+# Variable features for quick marker mode (pre-intersected with available genes)
+var_features <- readRDS("var_features.rds")
+var_features <- var_features[var_features %in% genes_by_idx]
+
+lookupCellIndices <- function(ids) {
+  idx <- match(as.character(ids), cellid_lookup)
+  sort(unique(idx[!is.na(idx)]))
+}
+
+# Shared cache for the sparse expression matrix.
+# Populated either by a background preload (session$onFlushed) or
+# synchronously on first marker request — whichever comes first.
+.expr_cache <- new.env(parent = emptyenv())
+.expr_cache$mat <- NULL
+
+buildExprSparse <- function() {
+  h5file <- H5File$new("sc1gexpr.h5", mode = "r")
+  on.exit(h5file$close_all(), add = TRUE)
+
+  h5data <- h5file[["grp"]][["data"]]
+  dims   <- h5data$dims
+  nGenes <- dims[1]
+  nCells <- dims[2]
+
+  # Read in row-chunks and accumulate sparse triplets to avoid
+  # materialising the full dense matrix (which doubles peak RAM).
+  # Target ~32 MB per chunk, adapting to dataset width.
+  chunk_size <- max(1L, as.integer(floor(32e6 / (nCells * 8L))))
+  n_chunks   <- ceiling(nGenes / chunk_size)
+  ti <- vector("list", n_chunks)
+  tj <- vector("list", n_chunks)
+  tx <- vector("list", n_chunks)
+
+  for (k in seq_len(n_chunks)) {
+    r1 <- (k - 1L) * chunk_size + 1L
+    r2 <- min(k * chunk_size, nGenes)
+    chunk <- h5data$read(args = list(r1:r2, quote(expr = )))
+    chunk[is.na(chunk)] <- 0
+    nz <- which(chunk != 0, arr.ind = TRUE)
+    if (nrow(nz) > 0L) {
+      ti[[k]] <- nz[, 1L] + (r1 - 1L)
+      tj[[k]] <- nz[, 2L]
+      tx[[k]] <- chunk[nz]
+    }
+  }
+
+  Matrix::sparseMatrix(
+    i    = unlist(ti),
+    j    = unlist(tj),
+    x    = as.double(unlist(tx)),
+    dims = c(nGenes, nCells),
+    dimnames = list(genes_by_idx, NULL)
+  )
+}
+
+selectorExprSparse <- function() {
+  if (!is.null(.expr_cache$mat)) return(.expr_cache$mat)
+  .expr_cache$mat <- buildExprSparse()
+  .expr_cache$mat
+}
+
+# Keep Enrichr network I/O off the main Shiny worker so marker tables render first.
+if (inherits(future::plan(), "sequential")) {
+  future::plan(future::multisession, workers = 2)
+}
+# Pre-warm one worker so subprocess startup doesn't compete with first renders.
+tryCatch(future::future({ TRUE }), error = function(e) NULL)
+
 
 
 ### Useful stuff 
@@ -659,11 +737,112 @@ scBubbHeat <- function(inpConf, inpMeta, inp, inpGrp, inpPlt,
 
 
 
-### Start server code 
-shinyServer(function(input, output, session) { 
-  ### For all tags and Server-side selectize 
-  observe_helpers() 
-  optCrt="{ option_create: function(data,escape) {return('<div class=\"create\"><strong>' + '</strong></div>');} }" 
+### Start server code
+shinyServer(function(input, output, session) {
+  ### For all tags and Server-side selectize
+  observe_helpers()
+
+  # Preload status: drives the live status line on the Selector tab.
+  # States: "idle" → "loading" → "ready" (or "failed").
+  preload_status_rv <- reactiveVal("idle")
+
+  # Phase 1: Show the status banner and disable buttons the instant the user
+  # opens the Selector tab — before any heavy work starts.
+  observeEvent(input$main_nav, {
+    if (identical(input$main_nav, "selector") &&
+        preload_status_rv() == "idle" &&
+        is.null(.expr_cache$mat)) {
+      preload_status_rv("loading")
+    }
+  })
+
+  # Phase 2: Start the actual H5 preload only after the Plotly UMAP has
+  # rendered (signalled by the JS onRender callback).  This guarantees the
+  # UMAP appears fast — the subprocess launch doesn't compete for CPU.
+  # The worker is already warm (pre-warmed at startup), so the future
+  # dispatches almost instantly.
+  observeEvent(input$sel_umap_rendered, {
+    if (is.null(.expr_cache$mat)) {
+      if (preload_status_rv() != "loading") preload_status_rv("loading")
+      promises::future_promise(
+        { buildExprSparse() },
+        packages = c("hdf5r", "Matrix")
+      ) %>% promises::then(
+        onFulfilled = function(mat) {
+          if (is.null(.expr_cache$mat)) .expr_cache$mat <- mat
+          preload_status_rv("ready")
+        },
+        onRejected = function(err) {
+          warning("Background sparse-matrix preload failed: ",
+                  conditionMessage(err))
+          preload_status_rv("failed")
+        }
+      )
+    }
+  }, once = TRUE)
+
+  output$preload_status <- renderUI({
+    st <- preload_status_rv()
+    if (st == "loading") {
+      div(class = "sel-status-banner is-loading",
+        div(class = "status-header",
+          span(class = "status-icon", icon("cog", class = "fa-spin")),
+          "Preparing marker engine"
+        ),
+        div(class = "status-detail",
+          "Loading expression data in the background.",
+          br(),
+          "Draw a lasso selection on the UMAP while this completes."
+        ),
+        div(class = "sel-progress-track",
+          div(class = "sel-progress-bar")
+        )
+      )
+    } else if (st == "ready") {
+      tagList(
+        div(class = "sel-status-banner is-ready", id = "sel-status-ready",
+          div(class = "status-header",
+            icon("check-circle"), "Marker engine ready"
+          ),
+          div(class = "status-detail",
+            "Select cells and click \u2018Find markers\u2019 to discover differentially expressed genes."
+          )
+        ),
+        tags$script(HTML("
+          setTimeout(function() {
+            var el = document.getElementById('sel-status-ready');
+            if (el) {
+              el.classList.add('fade-out');
+              setTimeout(function() { if (el) el.style.display = 'none'; }, 700);
+            }
+          }, 4000);
+        "))
+      )
+    } else if (st == "failed") {
+      div(class = "sel-status-banner is-failed",
+        div(class = "status-header",
+          icon("exclamation-triangle"), "Preload failed"
+        ),
+        div(class = "status-detail",
+          "The expression matrix will load on demand when you click \u2018Find markers\u2019.",
+          br(),
+          "This may take a few extra seconds."
+        )
+      )
+    } else {
+      NULL
+    }
+  })
+
+  # Disable "Find markers" buttons while engine is warming up,
+  # re-enable once ready (or on failure, so synchronous fallback works).
+  observe({
+    st <- preload_status_rv()
+    enabled <- st %in% c("idle", "ready", "failed")
+    session$sendCustomMessage("sel_engine_state", list(enabled = enabled))
+  })
+
+  optCrt="{ option_create: function(data,escape) {return('<div class=\"create\"><strong>' + '</strong></div>');} }"
   updateSelectizeInput(session, "sc1a1inp2", choices = names(sc1gene), server = TRUE, 
                        selected = sc1def$gene1, options = list( 
                          maxOptions = 7, create = TRUE, persist = TRUE, render = I(optCrt))) 
@@ -1161,9 +1340,6 @@ shinyServer(function(input, output, session) {
     }) 
   ### Plots for tab e1 
   
-  top_hvg <- readRDS("var_features.rds")
-  top_hvg <- intersect(top_hvg, names(sc1gene)) 
-  
   selected_cells_rv <- reactive({
     ids <- input$sel_ingroup_keys
     if (is.null(ids) || length(ids) == 0) NULL else ids
@@ -1173,7 +1349,18 @@ shinyServer(function(input, output, session) {
     if (is.null(ids) || length(ids) == 0) NULL else ids
   })
   marker_tbl_rv     <- reactiveVal(NULL)
-  sc1meta$cellid <- sc1meta$cellid %||% rownames(sc1meta)
+  sel_gene_rv       <- reactiveVal(NULL)   # gene to overlay on UMAP (NULL = metadata mode)
+
+  # Click a row in the marker table → show that gene's expression on UMAP.
+  # Click the same row again (deselect) → revert to metadata coloring.
+  observeEvent(input$sel_markers_tbl_rows_selected, {
+    row_idx <- input$sel_markers_tbl_rows_selected
+    if (length(row_idx) == 1 && !is.null(marker_tbl_rv())) {
+      sel_gene_rv(as.character(marker_tbl_rv()$feature[row_idx]))
+    } else {
+      sel_gene_rv(NULL)
+    }
+  }, ignoreNULL = FALSE, ignoreInit = TRUE)
 
   #### Tab e1 specific functions
 
@@ -1255,57 +1442,224 @@ shinyServer(function(input, output, session) {
 
   }
 
+  runSelectorMarkers <- function(group1, group2, quick = FALSE) {
+    shiny::validate(shiny::need(requireNamespace("presto", quietly = TRUE), "Package 'presto' is required for marker finding."))
+    group1 <- sort(unique(as.integer(group1)))
+    group2 <- sort(unique(as.integer(group2)))
+    group2 <- setdiff(group2, group1)
+
+    shiny::validate(shiny::need(length(group1) > 5, "Ingroup must have at least 5 cells"))
+    shiny::validate(shiny::need(length(group2) > 5, "Outgroup must have at least 5 cells"))
+
+    full_mat  <- selectorExprSparse()
+    sel_cols  <- sort(unique(c(group1, group2)))
+    all_cells <- length(sel_cols) == ncol(full_mat)
+
+    # Skip the column copy when comparing ingroup vs all other cells
+    expr <- if (all_cells) full_mat else full_mat[, sel_cols, drop = FALSE]
+
+    # Quick mode: restrict to variable features (~7x fewer tests)
+    if (quick && length(var_features) > 0L) {
+      vf_mask <- rownames(expr) %in% var_features
+      if (sum(vf_mask) > 0L) expr <- expr[vf_mask, , drop = FALSE]
+    }
+
+    # Drop genes with zero expression across all selected cells;
+    # they produce uninformative test results and slow down presto.
+    # tabulate on @i is O(nnz) and avoids materialising a logical matrix.
+    nz_per_gene <- tabulate(expr@i + 1L, nbins = nrow(expr))
+    keep <- nz_per_gene > 0L
+    if (any(!keep)) expr <- expr[keep, , drop = FALSE]
+
+    y <- rep("outgroup", length(sel_cols))
+    y[match(group1, sel_cols)] <- "ingroup"
+    y <- factor(y, levels = c("ingroup", "outgroup"))
+
+    res <- data.table::as.data.table(presto::wilcoxauc(X = expr, y = y))
+    res <- res[group == "ingroup", .(feature, group, avgExpr, logFC, statistic, auc, pval, padj, pct_in, pct_out)]
+    res <- res[order(-auc, pval, padj, -avgExpr)]
+    res
+  }
+
   # Enrichr Reactive value:
   enrichr_res_rv <- reactiveVal(NULL)
+  enrichr_status_rv <- reactiveVal(list(state = "idle", message = "Enrichr results will appear here."))
+  enrichr_job_state <- new.env(parent = emptyenv())
+  enrichr_job_state$request_id <- 0L
+  enrichr_job_state$active <- TRUE
 
+  session$onSessionEnded(function() {
+    enrichr_job_state$active <- FALSE
+  })
+
+  beginEnrichrRequest <- function() {
+    enrichr_job_state$request_id <- enrichr_job_state$request_id + 1L
+    enrichr_res_rv(NULL)
+    enrichr_status_rv(list(state = "idle", message = "Enrichr results will appear here."))
+    enrichr_job_state$request_id
+  }
+
+  launchEnrichrAsync <- function(top_genes, request_id) {
+    if (length(top_genes) <= 1) {
+      if (enrichr_job_state$active && identical(request_id, enrichr_job_state$request_id)) {
+        enrichr_res_rv(NULL)
+        enrichr_status_rv(list(
+          state = "empty",
+          message = "Not enough ranked genes were available to run Enrichr for the latest selection."
+        ))
+      }
+      return(invisible(NULL))
+    }
+
+    enrichr_status_rv(list(
+      state = "loading",
+      message = "Enrichr is updating in the background..."
+    ))
+
+    session$userData$enrichr_promise <- promises::then(
+      promises::future_promise(
+        {
+          runEnrichr(top_genes)
+        },
+        packages = c("httr", "jsonlite", "dplyr")
+      ),
+      onFulfilled = function(enr) {
+        if (!enrichr_job_state$active || !identical(request_id, enrichr_job_state$request_id)) {
+          return(NULL)
+        }
+
+        if (is.null(enr) || nrow(enr) == 0) {
+          enrichr_res_rv(NULL)
+          enrichr_status_rv(list(
+            state = "empty",
+            message = "Enrichr returned no results for the latest selection."
+          ))
+        } else {
+          enrichr_res_rv(enr)
+          enrichr_status_rv(list(state = "ready", message = NULL))
+        }
+        NULL
+      },
+      onRejected = function(error) {
+        if (!enrichr_job_state$active || !identical(request_id, enrichr_job_state$request_id)) {
+          return(NULL)
+        }
+
+        err_msg <- conditionMessage(error)
+        is_network <- grepl("resolve|connect|timeout|refused", err_msg, ignore.case = TRUE)
+        user_msg <- if (is_network) {
+          paste0("Could not reach Enrichr (network error: ", err_msg, "). Check your internet connection.")
+        } else {
+          paste0("Enrichr request failed: ", err_msg)
+        }
+
+        enrichr_res_rv(NULL)
+        enrichr_status_rv(list(state = "error", message = user_msg))
+        shiny::showNotification(user_msg, type = "error", duration = 8)
+        NULL
+      }
+    )
+
+    invisible(NULL)
+  }
+
+  # Resolve UMAP column names once using sc1conf (same source as all other tabs)
+  sel_umap_x <- sc1conf[dimred == TRUE & grepl("UMAP", UI, ignore.case = TRUE)]$ID[1]
+  sel_umap_y <- sc1conf[dimred == TRUE & grepl("UMAP", UI, ignore.case = TRUE)]$ID[2]
 
   output$sel_umap <- renderPlotly({
     req(input$sel_meta_col)
 
-    # Define the exact column names we want for the plot
-    desired_cols <- c("umap_1", "umap_2")
+    gene     <- sel_gene_rv()
+    meta_col <- input$sel_meta_col
 
-    # Check if both desired columns exist in the metadata
-    if (all(desired_cols %in% names(sc1meta))) {
-      umap_x <- desired_cols[1]
-      umap_y <- desired_cols[2]
+    # Base coordinates shared by both modes
+    plot_df <- data.frame(
+      x      = sc1meta[[sel_umap_x]],
+      y      = sc1meta[[sel_umap_y]],
+      cellid = sc1meta$cellid,
+      stringsAsFactors = FALSE
+    )
+
+    if (!is.null(gene) && gene %in% names(sc1gene)) {
+      # --- Expression mode: color by gene expression ---
+      if (!is.null(.expr_cache$mat) && gene %in% rownames(.expr_cache$mat)) {
+        expr_vals <- as.numeric(.expr_cache$mat[gene, ])
+      } else {
+        gene_idx <- sc1gene[[gene]]
+        h5file   <- H5File$new("sc1gexpr.h5", mode = "r")
+        on.exit(h5file$close_all(), add = TRUE)
+        expr_vals <- as.numeric(h5file[["grp"]][["data"]]$read(
+          args = list(gene_idx, quote(expr = ))))
+      }
+      plot_df$expr <- pmax(expr_vals, 0)
+
+      p <- plot_ly(
+        data   = plot_df,
+        x      = ~x,
+        y      = ~y,
+        type   = "scattergl",
+        mode   = "markers",
+        marker = list(size = 5, opacity = 0.7,
+                      color     = ~expr,
+                      colorscale = list(c(0, "#e0e0e0"), c(0.01, "#fee0d2"),
+                                        c(0.25, "#fc9272"), c(0.5, "#de2d26"),
+                                        c(1, "#67000d")),
+                      colorbar  = list(title = gene, len = 0.5)),
+        text      = ~paste0(gene, ": ", round(expr, 2)),
+        hoverinfo = "text",
+        key       = ~cellid,
+        customdata = ~cellid,
+        source    = "select_umap"
+      )
+      p_title <- paste0("UMAP \u2014 ", gene, " expression")
     } else {
-      warning("Did not find 'umap_1' and 'umap_2'. Falling back to a general UMAP/tSNE search.")
-      umap_x <- grep("UMAP|tSNE", names(sc1meta), value = TRUE, ignore.case = TRUE)[1]
-      umap_y <- grep("UMAP|tSNE", names(sc1meta), value = TRUE, ignore.case = TRUE)[2]
+      # --- Metadata mode: color by categorical metadata ---
+      pal <- get_palette_for_meta(meta_col, sc1conf, sc1meta)
+      plot_df$color <- sc1meta[[meta_col]]
+
+      p <- plot_ly(
+        data   = plot_df,
+        x      = ~x,
+        y      = ~y,
+        type   = "scattergl",
+        mode   = "markers",
+        marker = list(size = 5, opacity = 0.6),
+        color  = ~color,
+        colors = pal,
+        text     = ~paste0(meta_col, ": ", color),
+        hoverinfo= "text",
+        key      = ~cellid,
+        customdata = ~cellid,
+        source   = "select_umap"
+      )
+      p_title <- paste("UMAP coloured by", meta_col)
     }
 
-    # get the palette (or NULL if none defined)
-    pal <- get_palette_for_meta(input$sel_meta_col,
-                                sc1conf, sc1meta)
-
-    plot_ly(
-      data   = sc1meta,
-      x      = ~get(umap_x),
-      y      = ~get(umap_y),
-      type   = "scatter",
-      mode   = "markers",
-      marker = list(size = 5, opacity = 0.6),
-      color  = ~get(input$sel_meta_col),
-      colors = pal,
-      text     = ~paste0(input$sel_meta_col, ": ", get(input$sel_meta_col)),
-      hoverinfo= "text",
-      key      = ~cellid,
-      customdata = ~cellid,
-      source   = "select_umap"
-    ) %>%
+    p %>%
       layout(
-        title  = paste("UMAP coloured by", input$sel_meta_col),
-        xaxis  = list(title       = umap_x,
+        title  = p_title,
+        xaxis  = list(title       = sel_umap_x,
                       scaleanchor = "y",
                       scaleratio  = 1),
-        yaxis  = list(title = umap_y),
+        yaxis  = list(title = sel_umap_y),
         showlegend = FALSE,
         dragmode = "lasso"
       ) %>%
       event_register("plotly_selected") %>%
       htmlwidgets::onRender("
 function(el, x) {
+  // Signal Shiny that the UMAP widget is on screen
+  Shiny.setInputValue('sel_umap_rendered', true, {priority: 'event'});
+
+  // Fade out the loading spinner overlay
+  var spinner = document.getElementById('sel_umap_spinner');
+  if (spinner) {
+    spinner.style.transition = 'opacity 0.3s ease';
+    spinner.style.opacity = '0';
+    setTimeout(function() { spinner.style.display = 'none'; }, 300);
+  }
+
   var shiftHeld = false;
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Shift') shiftHeld = true;
@@ -1443,224 +1797,177 @@ function(el, x) {
   })
   
   observeEvent(input$do_marker, {
+    sel_gene_rv(NULL)
     withProgress(message = "Processing markers...", value = 0, {
-      # clear previous Enrichr results to force refresh even if identical genes
-      enrichr_res_rv(NULL)
+      enrichr_request_id <- beginEnrichrRequest()
       ids <- selected_cells_rv()
       shiny::validate(shiny::need(!is.null(ids) && length(ids) > 5, "Select at least 5 cells"))
 
-      # Map selected keys to row indices robustly (works for non-numeric cell IDs)
-      group1 <- which(sc1meta$cellid %in% ids)
+      group1 <- lookupCellIndices(ids)
       outgroup_ids <- outgroup_cells_rv()
       if (!is.null(outgroup_ids) && length(outgroup_ids) > 0) {
-        group2 <- which(sc1meta$cellid %in% outgroup_ids)
+        group2 <- lookupCellIndices(outgroup_ids)
         shiny::validate(shiny::need(length(group2) > 5, "Outgroup must have at least 5 cells"))
       } else {
         group2 <- setdiff(seq_len(nrow(sc1meta)), group1)
         req(length(group2) > 5)
       }
-      
-      h5file <- H5File$new("sc1gexpr.h5", mode = "r")
-      h5data <- h5file[["grp"]][["data"]]
-      
-      # Preallocate results for efficiency
-      res <- vector("list", length(top_hvg))
-      
-      # Process genes with progress updates
-      for (i in seq_along(top_hvg)) {
-        g <- top_hvg[i]
-        gi <- sc1gene[[g]]
-        expr <- h5data$read(args = list(gi, quote(expr = )))
-        
-        # Skip genes with all NA values in either group
-        if (all(is.na(expr[group1])) || all(is.na(expr[group2]))) {
-          next
-        }
-        
-        # Calculate statistics
-        m1 <- mean(expr[group1], na.rm = TRUE)
-        m2 <- mean(expr[group2], na.rm = TRUE)
-        v1 <- var(expr[group1], na.rm = TRUE)
-        v2 <- var(expr[group2], na.rm = TRUE)
-        n1 <- sum(!is.na(expr[group1]))
-        n2 <- sum(!is.na(expr[group2]))
-        # Skip if mean or variance is NA
-        if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) {
-          next
-        }
-        
-        t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
-                    (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
-        pooled_sd <- sqrt((((n1 - 1) * v1) + ((n2 - 1) * v2)) / pmax(n1 + n2 - 2, 1))
-        z <- ifelse(n1 < 2 | n2 < 2 | is.na(pooled_sd) | pooled_sd == 0, NA_real_,
-                    (m1 - m2) / (pooled_sd + 1e-8))
-        
-        res[[i]] <- data.table(gene = g, avg_sel = m1, avg_rest = m2, tstat = t, zscore = z)
-        
-        # Update progress
-        n <- length(top_hvg)
-        if (i %% 200 == 0 || i == n) incProgress(200 / n, detail = paste("Gene", i, "of", n))
-      }
-      
-      h5file$close_all()
-      
-      # Combine results and sort
-      res <- rbindlist(res, use.names = TRUE, fill = TRUE)
+
+      if (preload_status_rv() == "idle") preload_status_rv("loading")
+      incProgress(0.15, detail = "Loading expression matrix...")
+      res <- runSelectorMarkers(group1, group2, quick = isTRUE(input$sel_quick_mode))
+      if (preload_status_rv() != "ready") preload_status_rv("ready")
+      incProgress(0.7, detail = "Computing wilcoxauc markers...")
       if (is.null(res) || nrow(res) == 0) {
         enrichr_res_rv(NULL)
         marker_tbl_rv(NULL)
         shiny::showNotification("No marker statistics could be computed for the selection.", type = "error")
         return(NULL)
       }
-      # rank genes and run Enrichr on the top 200 genes
-      res_sorted <- res[order(-(tstat))]
-      top200 <- head(res_sorted$gene, 200)
-      if (length(top200) > 1) {
-        # try/catch so we do not leave stale plots on transient API errors
-        enr <- tryCatch(runEnrichr(top200), error = function(e) {
-          shiny::showNotification("Enrichr request failed. Please retry.", type = "error")
-          NULL
-        })
-        enrichr_res_rv(enr)
-      } else {
-        enrichr_res_rv(NULL)
-      }
-      res <- res_sorted[1:30]
+      # rank genes and run Enrichr on the top 200 genes (by AUC)
+      res_sorted <- res[order(-auc, pval, padj, -avgExpr)]
+      top200 <- head(res_sorted$feature, 200)
+      marker_tbl_rv(res_sorted)
+      res <- data.table::copy(head(res_sorted, 30))
       # Round numeric columns to 3 decimal places
       numeric_cols <- sapply(res, is.numeric)
       res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
       
-      marker_tbl_rv(res)
-
       output$sel_markers_tbl <- DT::renderDT({
-        DT::datatable(res, options = list(dom = "t", pageLength = 30), rownames = FALSE)
+        DT::datatable(res, options = list(dom = "t", pageLength = 30),
+                      rownames = FALSE, selection = "single")
       })
+
+      launchEnrichrAsync(top200, enrichr_request_id)
     })
   })
-  
-  # --- New: Reactive for metadata-based selection ---
-  meta_sel_col_rv <- reactive({
-    req(input$sel_meta_col)
-    input$sel_meta_col
+
+  # --- Metadata-based selection ---
+
+  # Optional subset filter: renderUI for filter-value multi-select
+  output$sel_meta_filter_ui <- renderUI({
+    filter_col <- input$sel_meta_filter_col
+    if (is.null(filter_col) || filter_col == "") return(NULL)
+    choices <- sort(unique(as.character(sc1meta[[filter_col]])))
+    tagList(
+      selectInput("sel_meta_filter_vals",
+                  paste0("Include only (", filter_col, "):"),
+                  choices = choices, selected = NULL, multiple = TRUE),
+      uiOutput("sel_filter_count")
+    )
   })
 
-  meta_sel_in_rv <- reactive({
-    req(input$sel_meta_in)
-    input$sel_meta_in
+  # Cell indices surviving the optional filter
+  filtered_cells_rv <- reactive({
+    filter_col  <- input$sel_meta_filter_col
+    filter_vals <- input$sel_meta_filter_vals
+    if (is.null(filter_col) || filter_col == "" ||
+        is.null(filter_vals) || length(filter_vals) == 0) {
+      return(seq_len(nrow(sc1meta)))
+    }
+    which(as.character(sc1meta[[filter_col]]) %in% filter_vals)
   })
 
-  meta_sel_out_rv <- reactive({
-    req(input$sel_meta_out)
-    input$sel_meta_out
+  # Show how many cells pass the filter
+  output$sel_filter_count <- renderUI({
+    n     <- length(filtered_cells_rv())
+    total <- nrow(sc1meta)
+    if (n < total) {
+      tags$small(style = "color:#666; font-style:italic;",
+                 sprintf("%s / %s cells in subset", format(n, big.mark = ","),
+                         format(total, big.mark = ",")))
+    }
   })
-  # renderUI for ingroup choices
+
+  meta_sel_col_rv <- reactive({ req(input$sel_meta_col); input$sel_meta_col })
+  meta_sel_in_rv  <- reactive({ req(input$sel_meta_in);  input$sel_meta_in  })
+  meta_sel_out_rv <- reactive({ req(input$sel_meta_out); input$sel_meta_out })
+
+  # Ingroup choices — restricted to values present in filtered cells
   output$sel_meta_in_ui <- renderUI({
     req(input$sel_meta_col)
-    # grab the unique levels / values from that column
-    choices <- sort(unique(sc1meta[[ input$sel_meta_col ]]))
-    selectInput(
-      "sel_meta_in",
-      "In-group (one or more):",
-      choices  = choices,
-      selected = NULL,
-      multiple = TRUE
-    )
+    cell_idx <- filtered_cells_rv()
+    choices <- sort(unique(as.character(sc1meta[[input$sel_meta_col]][cell_idx])))
+    selectInput("sel_meta_in", "In-group (one or more):",
+                choices = choices, selected = NULL, multiple = TRUE)
   })
 
-  # renderUI for outgroup choices
+  # Outgroup choices — same restriction
   output$sel_meta_out_ui <- renderUI({
     req(input$sel_meta_col)
-    choices <- sort(unique(sc1meta[[ input$sel_meta_col ]]))
-    selectInput(
-      "sel_meta_out",
-      "Out-group (one or more):",
-      choices  = choices,
-      selected = NULL,
-      multiple = TRUE
-    )
+    cell_idx <- filtered_cells_rv()
+    choices <- sort(unique(as.character(sc1meta[[input$sel_meta_col]][cell_idx])))
+    selectInput("sel_meta_out", "Out-group (one or more):",
+                choices = choices, selected = NULL, multiple = TRUE)
   })
   observeEvent(input$do_marker_meta, {
+    sel_gene_rv(NULL)
     withProgress(message = "Processing markers (metadata selection)...", value = 0, {
-      # clear previous Enrichr results to force refresh even if identical genes
-      enrichr_res_rv(NULL)
+      enrichr_request_id <- beginEnrichrRequest()
       meta_col <- meta_sel_col_rv()
       in_ids <- meta_sel_in_rv()
       out_ids <- meta_sel_out_rv()
       shiny::validate(shiny::need(length(in_ids) > 0, "Select at least one ingroup identity"))
       shiny::validate(shiny::need(length(out_ids) > 0, "Select at least one outgroup identity"))
-      group1 <- which(sc1meta[[meta_col]] %in% in_ids)
-      group2 <- which(sc1meta[[meta_col]] %in% out_ids)
-      shiny::validate(shiny::need(length(group1) > 5, "Ingroup must have at least 5 cells"))
-      shiny::validate(shiny::need(length(group2) > 5, "Outgroup must have at least 5 cells"))
+      cell_idx <- filtered_cells_rv()
+      group1 <- intersect(which(sc1meta[[meta_col]] %in% in_ids), cell_idx)
+      group2 <- intersect(which(sc1meta[[meta_col]] %in% out_ids), cell_idx)
+      shiny::validate(shiny::need(length(group1) > 5, "Ingroup must have at least 5 cells (check subset filter)"))
+      shiny::validate(shiny::need(length(group2) > 5, "Outgroup must have at least 5 cells (check subset filter)"))
 
-      h5file <- H5File$new("sc1gexpr.h5", mode = "r")
-      h5data <- h5file[["grp"]][["data"]]
-      res <- vector("list", length(top_hvg))
-      for (i in seq_along(top_hvg)) {
-        g <- top_hvg[i]
-        gi <- sc1gene[[g]]
-        expr <- h5data$read(args = list(gi, quote(expr = )))
-        if (all(is.na(expr[group1])) || all(is.na(expr[group2]))) next
-        m1 <- mean(expr[group1], na.rm = TRUE)
-        m2 <- mean(expr[group2], na.rm = TRUE)
-        v1 <- var(expr[group1], na.rm = TRUE)
-        v2 <- var(expr[group2], na.rm = TRUE)
-        n1 <- sum(!is.na(expr[group1]))
-        n2 <- sum(!is.na(expr[group2]))
-        if (is.na(m1) || is.na(m2) || is.na(v1) || is.na(v2)) next
-        t <- ifelse(n1 < 2 | n2 < 2, NA_real_,
-                    (m1 - m2) / sqrt((v1 / n1) + (v2 / n2) + 1e-8))
-        pooled_sd <- sqrt((((n1 - 1) * v1) + ((n2 - 1) * v2)) / pmax(n1 + n2 - 2, 1))
-        z <- ifelse(n1 < 2 | n2 < 2 | is.na(pooled_sd) | pooled_sd == 0, NA_real_,
-                    (m1 - m2) / (pooled_sd + 1e-8))
-        res[[i]] <- data.table(gene = g, avg_in = m1, avg_out = m2, tstat = t, zscore = z)
-        n <- length(top_hvg)
-        if (i %% 200 == 0 || i == n) incProgress(200 / n, detail = paste("Gene", i, "of", n))
-      }
-      h5file$close_all()
-      res <- rbindlist(res, use.names = TRUE, fill = TRUE)
+      if (preload_status_rv() == "idle") preload_status_rv("loading")
+      incProgress(0.15, detail = "Loading expression matrix...")
+      res <- runSelectorMarkers(group1, group2, quick = isTRUE(input$sel_quick_mode))
+      if (preload_status_rv() != "ready") preload_status_rv("ready")
+      incProgress(0.7, detail = "Computing wilcoxauc markers...")
       if (is.null(res) || nrow(res) == 0) {
         enrichr_res_rv(NULL)
         marker_tbl_rv(NULL)
         shiny::showNotification("No marker statistics could be computed for the metadata selection.", type = "error")
         return(NULL)
       }
-      # rank genes by t-stat before selecting top 200 for Enrichr
-      res_sorted <- res[order(-(tstat))]
-      top200 <- head(res_sorted$gene, 200)
-      if (length(top200) > 1) {
-        enr <- tryCatch(runEnrichr(top200), error = function(e) {
-          shiny::showNotification("Enrichr request failed. Please retry.", type = "error")
-          NULL
-        })
-        enrichr_res_rv(enr)
-      } else {
-        enrichr_res_rv(NULL)
-      }
-      res <- res_sorted[1:30]
+      # rank genes by AUC before selecting top 200 for Enrichr
+      res_sorted <- res[order(-auc, pval, padj, -avgExpr)]
+      top200 <- head(res_sorted$feature, 200)
+      marker_tbl_rv(res_sorted)
+      res <- data.table::copy(head(res_sorted, 30))
       numeric_cols <- sapply(res, is.numeric)
       res[, (names(res)[numeric_cols]) := lapply(.SD, round, 3), .SDcols = numeric_cols]
-      marker_tbl_rv(res)
       output$sel_markers_tbl <- DT::renderDT({
-        DT::datatable(res, options = list(dom = "t", pageLength = 30), rownames = FALSE)
+        DT::datatable(res, options = list(dom = "t", pageLength = 30),
+                      rownames = FALSE, selection = "single")
       })
+
+      launchEnrichrAsync(top200, enrichr_request_id)
     })
   })
-  
+
   output$sel_marker_dl <- downloadHandler(
     filename = function() "selector_markers.csv",
     content = function(file) {
       data.table::fwrite(marker_tbl_rv(), file)
     }
   )   
+
+  enrichrPlaceholder <- function() {
+    status <- enrichr_status_rv()
+    if (!is.null(status$message) && nzchar(status$message)) {
+      status$message
+    } else {
+      "Enrichr results will appear here."
+    }
+  }
   
   # Enrichr reactive table and plot
   output$enrichr_table <- DT::renderDT({
     df <- enrichr_res_rv()
-    req(df)
+    required_cols <- c("Library", "Term", "Pvalue", "CombinedScore", "Genes")
+    if (!is.data.frame(df) || nrow(df) == 0 || !all(required_cols %in% names(df))) {
+      shiny::validate(shiny::need(FALSE, enrichrPlaceholder()))
+    }
     # if you want a comma‐joined genes column:
-    df$GeneList <- sapply(df$Genes, paste, collapse = ", ")
-    out <- df %>% select(Library, Term, Pvalue, CombinedScore, GeneList)
+    df$GeneList <- vapply(df$Genes, function(x) paste(unlist(x), collapse = ", "), character(1))
+    out <- df[, c("Library", "Term", "Pvalue", "CombinedScore", "GeneList"), drop = FALSE]
     out$Pvalue <- as.numeric(formatC(out$Pvalue, format = "e", digits = 3))
 
     DT::datatable(
@@ -1676,7 +1983,10 @@ function(el, x) {
 
   output$enrichr_plot <- renderPlot({
     df <- enrichr_res_rv()
-    req(df)
+    required_cols <- c("Library", "Term", "CombinedScore")
+    if (!is.data.frame(df) || nrow(df) == 0 || !all(required_cols %in% names(df))) {
+      shiny::validate(shiny::need(FALSE, enrichrPlaceholder()))
+    }
     df <- df %>%
       mutate(
         TermWrap  = stringr::str_wrap(Term, width = 40),

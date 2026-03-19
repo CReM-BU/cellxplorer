@@ -1,5 +1,18 @@
 # Change History
 
+## Update: 02/13/2026
+
+Selector tab — Marker discovery switched to all genes with presto:
+
+  - Removed dependency on `var_features.rds` for "Find markers" in Tab e1.
+  - Added shared `runSelectorMarkers()` path using `presto::wilcoxauc` on all available genes.
+  - Applied the same marker engine to both:
+    - "Find markers for plot selection"
+    - "Find markers for metadata selection"
+  - Marker table columns now come directly from wilcoxauc output:
+    - `feature`, `group`, `avgExpr`, `logFC`, `statistic`, `auc`, `pval`, `padj`, `pct_in`, `pct_out`
+  - Enrichr input gene ranking now uses `auc` (descending), then p-value/p-adjusted p-value as tie-breakers.
+
 ## Update: 02/12/2026
 
 Selector tab — Positive and negative lasso selection:                                                                              
@@ -71,4 +84,3 @@ Selector tab — Positive and negative lasso selection:
   that variable (no legend)
   - Double grouping: User also selects "Cell information (X-axis fill, optional)" - plot shows violins/boxplots grouped by the first
   variable on X-axis, but colored/filled by the second variable (with legend)
-

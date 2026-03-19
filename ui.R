@@ -15,14 +15,121 @@ sc1def  = readRDS("sc1def.rds")
 shinyUI(fluidPage( 
 ### HTML formatting of error messages 
  
-tags$head(tags$style(HTML(".shiny-output-error-validation {color: red; font-weight: bold;}"))), 
-list(tags$style(HTML(".navbar-default .navbar-nav { font-weight: bold; font-size: 16px; }"))), 
+tags$head(
+  tags$style(HTML(".shiny-output-error-validation {color: red; font-weight: bold;}")),
+  tags$style(HTML(".navbar-default .navbar-nav { font-weight: bold; font-size: 16px; }")),
+  tags$style(HTML("
+    /* ── Selector tab: preload status banner ── */
+    .sel-status-banner {
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      line-height: 1.5;
+      transition: opacity 0.6s ease, max-height 0.6s ease,
+                  padding 0.6s ease, margin 0.6s ease, border-color 0.6s ease;
+      overflow: hidden;
+      max-height: 200px;
+    }
+    .sel-status-banner.is-loading {
+      background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
+      border: 1px solid #fcd34d;
+      color: #92400e;
+    }
+    .sel-status-banner.is-ready {
+      background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
+      border: 1px solid #6ee7b7;
+      color: #065f46;
+    }
+    .sel-status-banner.is-failed {
+      background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+      border: 1px solid #fca5a5;
+      color: #991b1b;
+    }
+    .sel-status-banner .status-header {
+      font-weight: 600;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .sel-status-banner .status-detail {
+      margin-top: 4px;
+      font-size: 12px;
+      opacity: 0.85;
+      padding-left: 26px;
+    }
+
+    /* Indeterminate progress bar */
+    .sel-progress-track {
+      height: 3px;
+      background: rgba(0,0,0,0.06);
+      border-radius: 2px;
+      margin-top: 12px;
+      overflow: hidden;
+    }
+    .sel-progress-track .sel-progress-bar {
+      height: 100%;
+      width: 35%;
+      border-radius: 2px;
+      background: linear-gradient(90deg, #f59e0b, #d97706, #f59e0b);
+      animation: sel-slide 1.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    }
+    @keyframes sel-slide {
+      0%   { transform: translateX(-120%); }
+      100% { transform: translateX(380%); }
+    }
+
+    /* Spinning icon pulse */
+    .sel-status-banner.is-loading .status-icon {
+      display: inline-block;
+      animation: sel-pulse 2s ease-in-out infinite;
+    }
+    @keyframes sel-pulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.45; }
+    }
+
+    /* Auto-fade for ready state */
+    .sel-status-banner.fade-out {
+      opacity: 0;
+      max-height: 0;
+      padding-top: 0;
+      padding-bottom: 0;
+      margin-bottom: 0;
+      border-color: transparent;
+    }
+
+    /* Marker buttons while engine is warming */
+    .btn.sel-btn-warming {
+      opacity: 0.45;
+      cursor: not-allowed !important;
+    }
+  ")),
+  tags$script(HTML("
+    $(document).on('shiny:connected', function() {
+      Shiny.addCustomMessageHandler('sel_engine_state', function(msg) {
+        ['do_marker', 'do_marker_meta'].forEach(function(id) {
+          var el = document.getElementById(id);
+          if (!el) return;
+          if (msg.enabled) {
+            el.disabled = false;
+            el.classList.remove('sel-btn-warming');
+          } else {
+            el.disabled = true;
+            el.classList.add('sel-btn-warming');
+          }
+        });
+      });
+    });
+  "))
+),
  
    
 ### Page title 
 titlePanel("Time series differentiation of human iPSC-derived alveolar type I cells (iAT1s) from iAT2s in 3D"),  
-navbarPage( 
-  NULL,  
+navbarPage(
+  NULL, id = "main_nav",  
  ### Tab1.a1: cellInfo vs geneExpr on dimRed 
   tabPanel( 
     HTML("CellInfo vs GeneExpr"), 
@@ -753,12 +860,19 @@ tabPanel(
 ### Tab1.e1: Cell selection 
 
   tabPanel(
-    HTML("Selector"),
+    HTML("Selector"), value = "selector",
     h4("Interactive cell selection and marker discovery"),
-    p("Lasso cells on UMAP to discover markers (top 3000 HVGs). Hold Shift and draw a second lasso to define an explicit outgroup.", style="font-size:90%;color:grey;"),
+    p("Lasso cells on UMAP to discover markers via Wilcoxon/AUC. Hold Shift and draw a second lasso to define an explicit outgroup.", style="font-size:90%;color:grey;"),
     fluidRow(
       column(7,
-             plotlyOutput("sel_umap", height = "600px"), 
+             div(style = "position:relative; min-height:600px;",
+               div(id = "sel_umap_spinner",
+                   style = "position:absolute; inset:0; display:flex; align-items:center; justify-content:center; flex-direction:column; color:#9ca3af; background:#f9fafb; border-radius:6px; z-index:10;",
+                   icon("circle-notch", class = "fa-spin fa-2x"),
+                   tags$p("Loading UMAP...", style = "margin-top:16px; font-size:14px;")
+               ),
+               plotlyOutput("sel_umap", height = "600px")
+             ),
              div(style="font-size:80%;color:#888;","Select cells with lasso or box tool. Hold Shift and draw a second selection to define an outgroup. A new ingroup selection automatically resets both groups. Double-click to clear all selections."),
              hr(),
              h4("Enrichr results (using top 200 genes)") %>%
@@ -785,11 +899,16 @@ tabPanel(
              )
       ),
       column(5, br(),
+             uiOutput("preload_status"),
+             checkboxInput("sel_quick_mode", "Quick mode (variable features only)", value = TRUE),
              actionButton("do_marker", "Find markers for plot selection", icon = icon("magic")),
              br(),br(),
-             # --- New: Metadata-based selection UI ---
+             # --- Metadata-based selection UI ---
              h5("Or select cells by metadata group:"),
-             selectInput("sel_meta_col", "Metadata column:",
+             selectInput("sel_meta_filter_col", "Subset cells by (optional):",
+                         choices = c("(no filter)" = "", sc1conf[grp == TRUE]$UI)),
+             uiOutput("sel_meta_filter_ui"),
+             selectInput("sel_meta_col", "Compare by:",
                          choices = sc1conf[grp == TRUE]$UI, selected = sc1conf[grp == TRUE]$UI[1]),
              uiOutput("sel_meta_in_ui"),
              uiOutput("sel_meta_out_ui"),
@@ -813,7 +932,6 @@ p(a("Center for Regenerative Medicine of Boston University and Boston Medical Ce
     href = "https://crem.bu.edu/", target="_blank"),style = "font-size: 125%;"),
 img(src='logo.png', height="12%", width="12%", align = "left"),
 )))
-
 
 
 
